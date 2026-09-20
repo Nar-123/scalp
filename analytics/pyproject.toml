@@ -1,0 +1,12 @@
+[project]
+name = "scalp-analytics"
+version = "0.1.0"
+description = "Local analytics / learning pipeline for the New-Token Ultra Scalper V1 (placeholder in Phase 1)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
