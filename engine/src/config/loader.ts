@@ -37,6 +37,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     aggregators: {
       birdeyeApiKey: env.BIRDEYE_API_KEY || undefined,
     },
+    execution: {
+      liveTradingExplicitlyEnabled:
+        env.LIVE_TRADING_EXPLICITLY_ENABLED === undefined
+          ? undefined
+          : envBool(env.LIVE_TRADING_EXPLICITLY_ENABLED, false),
+      walletCredentialPath: env.WALLET_CREDENTIAL_PATH || undefined,
+    },
     ledger: {
       dbPath: env.LEDGER_DB_PATH ?? undefined,
     },

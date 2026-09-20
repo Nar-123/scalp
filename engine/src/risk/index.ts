@@ -1,4 +1,5 @@
 export * from './types.js';
+export * from './hardLimits.js';
 export * from './positionSizing.js';
 export * from './dailyLossCircuitBreaker.js';
 export * from './exposureManager.js';

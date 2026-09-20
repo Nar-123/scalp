@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from analytics.ledger_reader import get_daily_risk_states, get_trade_summary, open_ledger_readonly
+from analytics.reader import get_daily_risk_states, get_trade_summary, open_ledger_readonly
 from analytics.schema_contract import DAILY_RISK_STATE_TABLE, TRADES_COLUMNS, TRADES_TABLE
 
 

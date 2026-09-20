@@ -108,6 +108,12 @@ export const ConfigSchema = z.object({
     .object({
       latencySlippageBufferPct: z.number().nonnegative().default(0.3),
       fallbackPriceImpactPct: z.number().nonnegative().default(1),
+      // Second, independent switch required (in addition to dryRun=false)
+      // before any real signature/broadcast may occur -- see
+      // DryRunGuardedSigner. Never set true by inferring it from anything
+      // else; must be an explicit, deliberate operator choice.
+      liveTradingExplicitlyEnabled: z.boolean().default(false),
+      walletCredentialPath: z.string().optional(),
     })
     .default({}),
 

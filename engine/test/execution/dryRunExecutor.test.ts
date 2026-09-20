@@ -4,7 +4,7 @@ import type { PriceSource } from '../../src/execution/types.js';
 
 const cfg = {
   edge: { dexFeeBps: 25, swapFeeBps: 5, networkFeeSol: 0.000005, priorityFeeSol: 0.0005, safetyMarginBps: 50 },
-  execution: { latencySlippageBufferPct: 0.3, fallbackPriceImpactPct: 1 },
+  execution: { latencySlippageBufferPct: 0.3, fallbackPriceImpactPct: 1, liveTradingExplicitlyEnabled: false },
 };
 
 function priceSource(overrides: Partial<PriceSource> = {}): PriceSource {
@@ -61,7 +61,7 @@ describe('DryRunExecutor', () => {
   });
 
   it('never lets filledAmountSol go negative even under extreme fees/impact', async () => {
-    const extremeCfg = { ...cfg, execution: { latencySlippageBufferPct: 200, fallbackPriceImpactPct: 60 } };
+    const extremeCfg = { ...cfg, execution: { latencySlippageBufferPct: 200, fallbackPriceImpactPct: 60, liveTradingExplicitlyEnabled: false } };
     const executor = new DryRunExecutor(priceSource(), extremeCfg);
     const fill = await executor.buy({ mint: 'MINT', amountSol: 0.3, maxSlippageBps: 100 });
     expect(fill.filledAmountSol).toBe(0);

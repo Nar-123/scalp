@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
 
-from .schema_contract import DAILY_RISK_STATE_TABLE, TRADES_TABLE
+from .schema_contract import DAILY_RISK_STATE_TABLE, TRADES_TABLE, TOKEN_EVALUATIONS_TABLE
 
 
 @contextmanager
@@ -67,3 +67,33 @@ def get_daily_risk_states(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         f"SELECT * FROM {DAILY_RISK_STATE_TABLE} ORDER BY trading_date_utc DESC"
     ).fetchall()
+
+
+def get_closed_trades(conn: sqlite3.Connection, strategy_version: str | None = None) -> list[dict]:
+    """All closed trades as plain dicts, ordered by entry_time_ms ascending
+    (chronological order matters -- callers doing time-based train/validation/
+    out-of-sample splits, drawdown, or consecutive-loss-streak calculations
+    all depend on this ordering; see learning/validation.py's temporal split).
+    """
+    query = f"SELECT * FROM {TRADES_TABLE} WHERE status = 'closed'"
+    params: tuple = ()
+    if strategy_version is not None:
+        query += " AND strategy_version = ?"
+        params = (strategy_version,)
+    query += " ORDER BY entry_time_ms ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_token_evaluations(conn: sqlite3.Connection, strategy_version: str | None = None) -> list[dict]:
+    """Every scored token (traded or not) -- what pattern discovery needs to
+    tell "we saw this condition and skipped it" apart from "we saw this
+    condition and it lost money"."""
+    query = f"SELECT * FROM {TOKEN_EVALUATIONS_TABLE}"
+    params: tuple = ()
+    if strategy_version is not None:
+        query += " WHERE strategy_version = ?"
+        params = (strategy_version,)
+    query += " ORDER BY evaluated_at_ms ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
