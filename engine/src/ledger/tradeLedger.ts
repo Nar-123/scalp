@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { OpenPositionSummary } from '../risk/types.js';
 import type {
+  RecoverableOpenTrade,
   TokenEvaluationRecord,
   TokenTradeHistory,
   TradeEntryRecord,
@@ -21,6 +22,23 @@ interface TradeRow {
   id: string;
   mint: string;
   entry_size_sol: number;
+}
+
+interface RecoverableTradeRow {
+  id: string;
+  mint: string;
+  pool_address: string | null;
+  entry_time_ms: number;
+  entry_price_sol: number;
+  entry_size_sol: number;
+  entry_filled_amount_sol: number | null;
+  entry_token_amount_raw: string | null;
+  entry_fees_sol: number | null;
+  entry_liquidity_sol: number | null;
+  reentry_index: number;
+  strategy_version: string;
+  dry_run: number;
+  reconciliation_reason: string | null;
 }
 
 interface DailyRiskRow {
@@ -109,14 +127,16 @@ export class TradeLedger {
           entry_volume_1m_sol, entry_buy_sell_ratio, entry_price_velocity_5s_pct, entry_volume_acceleration_x,
           entry_score, entry_score_components, expected_net_edge_pct, expected_net_edge_breakdown,
           entry_slippage_pct, entry_price_impact_pct, entry_fees_sol, entry_tx_signature, entry_safety_check_id,
-          daily_realized_pnl_sol_at_entry, entry_token_amount_raw, entry_context_json, status, created_at_ms, updated_at_ms
+          daily_realized_pnl_sol_at_entry, entry_token_amount_raw, entry_filled_amount_sol, entry_context_json,
+          status, created_at_ms, updated_at_ms
         ) VALUES (
           @id, @mint, @poolAddress, @strategyVersion, @dryRun, @reentryIndex,
           @entryTimeMs, @entryPriceSol, @entrySizeSol, @entryTokenAgeSec, @entryLiquiditySol,
           @entryVolume1mSol, @entryBuySellRatio, @entryPriceVelocity5sPct, @entryVolumeAccelerationX,
           @entryScore, @entryScoreComponents, @expectedNetEdgePct, @expectedNetEdgeBreakdown,
           @entrySlippagePct, @entryPriceImpactPct, @entryFeesSol, @entryTxSignature, @entrySafetyCheckId,
-          @dailyRealizedPnlSolAtEntry, @entryTokenAmountRaw, @entryContextJson, 'open', @createdAtMs, @updatedAtMs
+          @dailyRealizedPnlSolAtEntry, @entryTokenAmountRaw, @entryFilledAmountSol, @entryContextJson,
+          'open', @createdAtMs, @updatedAtMs
         )`,
       )
       .run({
@@ -146,6 +166,7 @@ export class TradeLedger {
         entrySafetyCheckId: entry.entrySafetyCheckId,
         dailyRealizedPnlSolAtEntry: entry.dailyRealizedPnlSolAtEntry,
         entryTokenAmountRaw: entry.entryTokenAmountRaw ?? null,
+        entryFilledAmountSol: entry.entryFilledAmountSol ?? null,
         entryContextJson: toJson(entry.entryContext ?? null),
         createdAtMs: now,
         updatedAtMs: now,
@@ -192,6 +213,83 @@ export class TradeLedger {
       .prepare(`SELECT id, mint, entry_size_sol FROM trades WHERE status = 'open'`)
       .all() as unknown as TradeRow[];
     return rows.map((row) => ({ tradeId: row.id, mint: row.mint, entrySizeSol: row.entry_size_sol }));
+  }
+
+  /**
+   * Full entry data for every ledger row with `status = 'open'` -- the raw material `positionRecovery.ts` uses to
+   * reconstruct (or safely refuse to reconstruct) each one into a live, monitored `Position` at startup. Exposure
+   * accounting (`getOpenPositions`, used by risk/exposureManager.ts) is untouched and keeps counting these rows
+   * exactly as before, whether or not recovery can safely resume managing them.
+   */
+  getRecoverableOpenPositions(): RecoverableOpenTrade[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, mint, pool_address, entry_time_ms, entry_price_sol, entry_size_sol,
+                entry_filled_amount_sol, entry_token_amount_raw, entry_fees_sol, entry_liquidity_sol,
+                reentry_index, strategy_version, dry_run, reconciliation_reason
+         FROM trades WHERE status = 'open'`,
+      )
+      .all() as unknown as RecoverableTradeRow[];
+    return rows.map((row) => ({
+      tradeId: row.id,
+      mint: row.mint,
+      poolAddress: row.pool_address,
+      entryTimeMs: row.entry_time_ms,
+      entryPriceSol: row.entry_price_sol,
+      entrySizeSol: row.entry_size_sol,
+      entryFilledAmountSol: row.entry_filled_amount_sol,
+      entryTokenAmountRaw: row.entry_token_amount_raw,
+      entryFeesSol: row.entry_fees_sol,
+      entryLiquiditySol: row.entry_liquidity_sol,
+      reentryIndex: row.reentry_index,
+      strategyVersion: row.strategy_version,
+      dryRun: row.dry_run === 1,
+      reconciliationReason: row.reconciliation_reason,
+    }));
+  }
+
+  /**
+   * Marks a trade so it can never be resumed for automatic trading -- neither in this process (PositionMonitor
+   * checks `needsReconciliation`/its own in-memory flag before every poll) nor after a restart (positionRecovery.ts
+   * reads this column and refuses to reconstruct a live Position for it, however complete the entry data looks).
+   * Used exclusively for the case where a sell is confirmed EXECUTED but the ledger write that should have recorded
+   * it then fails (see `recordExitAtomic` / positionMonitor.closePosition) -- the trade's real on-chain state may
+   * already differ from what the rest of this row says. The first reason recorded is kept (COALESCE): later calls
+   * for the same trade never overwrite the original diagnostic. A no-op if the trade id does not exist.
+   */
+  markReconciliationNeeded(tradeId: string, reason: string, nowMs: number = Date.now()): void {
+    this.db
+      .prepare(`UPDATE trades SET reconciliation_reason = COALESCE(reconciliation_reason, @reason), updated_at_ms = @nowMs WHERE id = @tradeId`)
+      .run({ reason, nowMs, tradeId });
+  }
+
+  /**
+   * Runs `fn` -- an arbitrary sequence of further calls back into this SAME ledger instance (e.g. `recordExit`,
+   * `applyRealizedPnl`, `latchCircuitBreaker`) -- inside one SQLite transaction. Either every write `fn` makes
+   * commits together, or (on any thrown error) NONE of them do: `fn` throwing rolls the whole thing back before the
+   * error is re-thrown to the caller.
+   *
+   * Exists because a successful position close used to apply the daily-PnL delta, record the trade's exit fields,
+   * and (conditionally) latch the circuit breaker as three separate, un-transacted statements -- a crash or a
+   * genuine SQLite failure between any two of them could leave the ledger showing a still-'open' trade with its
+   * realized PnL already counted, or a 'closed' trade whose daily PnL never moved. See
+   * positionMonitor.ts:closePosition, which is the only current caller, and which does NOT remove the position from
+   * its own in-memory tracking until this call returns successfully.
+   */
+  runExitTransaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Nothing to roll back if BEGIN itself never took effect; the original error is what matters to the caller.
+      }
+      throw err;
+    }
   }
 
   getDailyRealizedPnl(dateIsoUtc: string): number {

@@ -38,6 +38,7 @@ function liveCurveService(opts: { graduate?: boolean; neverSeen?: boolean } = {}
       [end - 35, () => sim.sell(30_000_000_000_000n)],
       [end - 25, () => sim.buy(6_000_000_000n)],
       [end - 10, () => sim.buy(5_000_000_000n)],
+      [end - 3, () => sim.buy(1_000_000_000n)], // keeps MINT within the default 5 s per-token freshness bound of `end`
     ];
     for (const [ts, step] of trades) {
       const s = step();

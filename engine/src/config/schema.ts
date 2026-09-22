@@ -140,7 +140,9 @@ export const ConfigSchema = z.object({
       // Phase 5.5: native bonding-curve market data (price, liquidity, exact price impact) as the PRIMARY source for
       // Pump.fun tokens. Off => the Phase 5.4B behavior (DexScreener market data, native volume only).
       nativeMarketEnabled: z.boolean().default(true),
-      // Largest tolerated gap between the price/liquidity as-of second and the volume window end (event seconds).
+      // Largest tolerated gap (event seconds) between the price/liquidity as-of second and the volume window end,
+      // AND (P1 fix) between a token's own last curve-changing trade and the stream watermark -- see
+      // PumpfunVolumeEngineOptions.maxSnapshotSkewSec. Default 5 (existing, unchanged production value).
       nativeMaxSnapshotSkewSec: z.number().int().positive().default(5),
       // Default false: a Pump.fun curve token whose native state is unprovable is market_data_unavailable, not silently priced by DexScreener.
       dexscreenerFallbackForCurveTokens: z.boolean().default(false),
@@ -156,6 +158,12 @@ export const ConfigSchema = z.object({
         .object({
           apiKey: z.string().optional(),
           fallbackUrls: z.array(z.string().url()).default([]),
+          // P1 credential-isolation fix: index-aligned with fallbackUrls. An empty/missing entry for a given
+          // fallback means that endpoint gets NO credential -- it never automatically inherits `apiKey`, which is
+          // the primary endpoint's alone. Deliberately NOT validated to be the same length as fallbackUrls: a
+          // short/empty array (the default, and every existing single-primary deployment) just means every
+          // fallback has no credential, which is exactly the safe default.
+          fallbackApiKeys: z.array(z.string()).default([]),
           timeoutMs: z.number().int().positive().default(4000),
           maxConcurrent: z.number().int().positive().default(4),
           maxRequestsPerSecond: z.number().positive().default(8),
@@ -174,6 +182,8 @@ export const ConfigSchema = z.object({
         .object({
           apiKey: z.string().optional(),
           fallbackUrls: z.array(z.string().url()).default([]),
+          // Same isolation rule as providers.rpc.fallbackApiKeys, for the quote (Jupiter) fallbacks.
+          fallbackApiKeys: z.array(z.string()).default([]),
           timeoutMs: z.number().int().positive().default(4000),
           maxConcurrent: z.number().int().positive().default(4),
           maxRequestsPerSecond: z.number().positive().default(4),

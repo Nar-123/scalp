@@ -260,6 +260,9 @@ describe('NativePathObserver reads only the in-memory native cache', () => {
     const sim = new CurveSim();
     f.create(mintId(11), BASE_TS + 100);
     f.curveTrade(mintId(11), sim.buy(8_000_000_000n), BASE_TS + 150);
+    // A second, small trade close to the query time keeps the curve within the default 5 s per-token freshness
+    // bound (see the P1 fix in pumpfunVolumeEngine.ts:resolveCurve).
+    f.curveTrade(mintId(11), sim.buy(100_000_000n), BASE_TS + 200);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const snap = f.engine.getNativeMarketSnapshot(mintId(11), 0.3, at(BASE_TS + 201));
     const o = new NativePathObserver(f.engine).observe(mintId(11), snap.buyTokenAmountRaw, at(BASE_TS + 201));
@@ -281,6 +284,9 @@ describe('NativePathObserver reads only the in-memory native cache', () => {
     const sim = new CurveSim();
     f.create(mintId(12), BASE_TS + 100);
     f.curveTrade(mintId(12), sim.buy(8_000_000_000n), BASE_TS + 150);
+    // A second, small trade close to the query time keeps the curve within the default 5 s per-token freshness
+    // bound (see the P1 fix in pumpfunVolumeEngine.ts:resolveCurve).
+    f.curveTrade(mintId(12), sim.buy(100_000_000n), BASE_TS + 200);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const noAmount = obsv.observe(mintId(12), null, at(BASE_TS + 201));
     expect(noAmount.priceSol).not.toBeNull();

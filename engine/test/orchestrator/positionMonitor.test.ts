@@ -251,3 +251,270 @@ describe('PositionMonitor: sell that did not execute must never be treated as a 
     expect(after.circuitBreakerTriggered).toBe(false);
   });
 });
+
+describe('PositionMonitor: hasPosition / markReconciliationNeeded', () => {
+  it('hasPosition reflects addPosition / a successful close', async () => {
+    const { monitor } = setup([ok()]);
+    expect(monitor.hasPosition('t1')).toBe(true);
+    await poll(monitor);
+    expect(monitor.hasPosition('t1')).toBe(false);
+  });
+
+  it('markReconciliationNeeded flags the trade, trips the emergency stop, and is idempotent', () => {
+    const { monitor, emergencyStop } = setup([ok()]);
+    monitor.markReconciliationNeeded('t1', 'M', 'some_reason', 12345);
+    expect(monitor.needsReconciliation('t1')).toBe(true);
+    expect(emergencyStop.trigger).toHaveBeenCalledWith('some_reason', 12345);
+    expect(monitor.sellReconciliationEvents).toBe(1);
+    monitor.markReconciliationNeeded('t1', 'M', 'some_reason', 99999);
+    expect(monitor.sellReconciliationEvents).toBe(2); // trigger is called again (harmless), but see the position-recovery test for the persisted-reason idempotency
+  });
+
+  it('a position flagged via markReconciliationNeeded (without ever being addPosition-ed) is never polled', async () => {
+    const { monitor, sells } = setup([ok()]);
+    monitor.markReconciliationNeeded('never-added', 'M', 'reason');
+    // pollAll() only ever iterates `this.positions`, so a trade flagged without being added is trivially never
+    // polled -- this just documents that guarantee explicitly.
+    await poll(monitor);
+    expect(sells).toHaveLength(1); // only the ONE addPosition-ed fixture position (t1) was ever polled
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P1 fix #2 (Phase 3): emergency-stop / max-hold-timeout must not depend on price availability. The pre-fix code
+// returned from pollOne() immediately when the price provider answered null, BEFORE evaluateExit() ever ran -- so an
+// emergency stop, or an expired max-hold timeout, could never force-close a position simply because the price feed
+// happened to be down at that moment. See exit/exitEngine.ts (the actual gating logic) and exit/types.ts
+// (currentPriceSol/currentLiquiditySol are now independently nullable).
+// ---------------------------------------------------------------------------------------------------------------------
+describe('PositionMonitor: exits that do not need price must still fire when price is unavailable', () => {
+  function setupNoPrice(overrides: { emergencyStopTriggered?: boolean; entryTimeMs?: number } = {}) {
+    const db = openLedger(':memory:');
+    const ledger = new TradeLedger(db);
+    const sells: unknown[] = [];
+    const executor = {
+      buy: async () => {
+        throw new Error('no');
+      },
+      sell: async (p: unknown) => {
+        sells.push(p);
+        return ok();
+      },
+    };
+    const priceSource = { getPrice: vi.fn().mockResolvedValue(null), getEstimatedPriceImpactPct: vi.fn(), getBuyExecutionQuote: vi.fn(), getSellPriceImpactPct: vi.fn() };
+    const aggregator = { getPrice: async () => null, getHolderConcentration: async () => null, getLiquidityAndVolume: async () => null };
+    const emergencyStop = { isTriggered: () => overrides.emergencyStopTriggered ?? false, trigger: vi.fn() };
+    const monitor = new PositionMonitor(
+      { executor, priceSource: priceSource as never, aggregator: aggregator as never, ledger, emergencyStop: emergencyStop as never, logger },
+      cfg,
+      HARD_RISK_PARAMETERS,
+    );
+    const now = Date.now();
+    ledger.recordEntry({
+      id: 't1',
+      mint: 'M',
+      poolAddress: null,
+      strategyVersion: 'v',
+      dryRun: true,
+      reentryIndex: 0,
+      entryTimeMs: overrides.entryTimeMs ?? now,
+      entryPriceSol: 1,
+      entrySizeSol: 0.3,
+      entryTokenAgeSec: 100,
+      entryLiquiditySol: 40,
+      entryVolume1mSol: 6,
+      entryBuySellRatio: 2,
+      entryPriceVelocity5sPct: 2,
+      entryVolumeAccelerationX: 2,
+      entryScore: 5,
+      entryScoreComponents: null,
+      expectedNetEdgePct: 0.5,
+      expectedNetEdgeBreakdown: null,
+      entrySlippagePct: 0.3,
+      entryPriceImpactPct: 0.4,
+      entryFeesSol: 0.001,
+      entryTxSignature: null,
+      entrySafetyCheckId: null,
+      dailyRealizedPnlSolAtEntry: 0,
+      entryTokenAmountRaw: '5000000',
+      entryFilledAmountSol: 0.29,
+    });
+    monitor.addPosition({
+      tradeId: 't1',
+      mint: 'M',
+      poolAddress: null,
+      entryTimeMs: overrides.entryTimeMs ?? now,
+      entryPriceSol: 1,
+      entrySizeSol: 0.3,
+      entryFilledAmountSol: 0.29,
+      entryTokenAmountRaw: '5000000',
+      entryFeesSol: 0.001,
+      reentryIndex: 0,
+      strategyVersion: 'v',
+      dryRun: true,
+      priceHistory: [{ priceSol: 1, liquiditySol: 40, timestampMs: overrides.entryTimeMs ?? now }],
+      peakPriceSol: 1,
+      troughPriceSol: 1,
+    });
+    return { monitor, ledger, sells };
+  }
+
+  it('price unavailable + emergency stop triggered => the exit attempt still happens (a sell is attempted)', async () => {
+    const { monitor, sells } = setupNoPrice({ emergencyStopTriggered: true });
+    await poll(monitor);
+    expect(sells).toHaveLength(1);
+    expect(monitor.getOpenCount()).toBe(0); // the sell in this fixture succeeds -> closed
+  });
+
+  it('price unavailable + max-hold time already expired => the exit attempt still happens', async () => {
+    const staleEntry = Date.now() - (cfg.exits.maxHoldTimeSec + 60) * 1000;
+    const { monitor, sells } = setupNoPrice({ entryTimeMs: staleEntry });
+    await poll(monitor);
+    expect(sells).toHaveLength(1);
+    expect(monitor.getOpenCount()).toBe(0);
+  });
+
+  it('price unavailable + no non-price exit condition applies => the position remains open, no sell attempted', async () => {
+    const { monitor, sells } = setupNoPrice(); // emergencyStopTriggered: false, entry just now (max-hold not reached)
+    await poll(monitor);
+    expect(sells).toHaveLength(0);
+    expect(monitor.getOpenCount()).toBe(1);
+  });
+
+  it('price unavailable never fabricates a price or a PnL: peak/trough/priceHistory are untouched when nothing else exits', async () => {
+    const { monitor } = setupNoPrice();
+    type Internal = { positions: Map<string, { priceHistory: unknown[]; peakPriceSol: number; troughPriceSol: number }> };
+    const before = { ...(monitor as unknown as Internal).positions.get('t1')! };
+    await poll(monitor);
+    const after = (monitor as unknown as Internal).positions.get('t1')!;
+    expect(after.priceHistory).toHaveLength(1); // no fabricated point pushed
+    expect(after.peakPriceSol).toBe(before.peakPriceSol);
+    expect(after.troughPriceSol).toBe(before.troughPriceSol);
+  });
+
+  it('current price available => existing price-dependent behavior is unchanged (dynamic_sl still fires on a real drop)', async () => {
+    const db = openLedger(':memory:');
+    const ledger = new TradeLedger(db);
+    const sells: unknown[] = [];
+    const executor = { buy: async () => { throw new Error('no'); }, sell: async (p: unknown) => { sells.push(p); return ok(); } };
+    const priceSource = { getPrice: vi.fn().mockResolvedValue(0.85), getEstimatedPriceImpactPct: vi.fn(), getBuyExecutionQuote: vi.fn(), getSellPriceImpactPct: vi.fn() };
+    const aggregator = { getPrice: async () => 0.85, getHolderConcentration: async () => null, getLiquidityAndVolume: async () => ({ liquiditySol: 40, volume1mSol: 1, buySellRatio: 1, txCount1m: 1 }) };
+    const emergencyStop = { isTriggered: () => false, trigger: vi.fn() };
+    const monitor = new PositionMonitor({ executor, priceSource: priceSource as never, aggregator: aggregator as never, ledger, emergencyStop: emergencyStop as never, logger }, cfg, HARD_RISK_PARAMETERS);
+    const now = Date.now();
+    ledger.recordEntry({
+      id: 't1', mint: 'M', poolAddress: null, strategyVersion: 'v', dryRun: true, reentryIndex: 0,
+      entryTimeMs: now, entryPriceSol: 1, entrySizeSol: 0.3, entryTokenAgeSec: 100, entryLiquiditySol: 40,
+      entryVolume1mSol: 6, entryBuySellRatio: 2, entryPriceVelocity5sPct: 2, entryVolumeAccelerationX: 2,
+      entryScore: 5, entryScoreComponents: null, expectedNetEdgePct: 0.5, expectedNetEdgeBreakdown: null,
+      entrySlippagePct: 0.3, entryPriceImpactPct: 0.4, entryFeesSol: 0.001, entryTxSignature: null,
+      entrySafetyCheckId: null, dailyRealizedPnlSolAtEntry: 0, entryTokenAmountRaw: '5000000', entryFilledAmountSol: 0.29,
+    });
+    monitor.addPosition({
+      tradeId: 't1', mint: 'M', poolAddress: null, entryTimeMs: now, entryPriceSol: 1, entrySizeSol: 0.3,
+      entryFilledAmountSol: 0.29, entryTokenAmountRaw: '5000000', entryFeesSol: 0.001, reentryIndex: 0,
+      strategyVersion: 'v', dryRun: true, priceHistory: [{ priceSol: 1, liquiditySol: 40, timestampMs: now }],
+      peakPriceSol: 1, troughPriceSol: 1,
+    });
+    await poll(monitor);
+    expect(sells).toHaveLength(1); // -15% pnl breaches the -10% default dynamic stop loss, exactly as before this fix
+    expect(monitor.getOpenCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2 fix: atomic exit persistence. A successful close used to (1) delete the position from in-memory tracking, THEN
+// (2) apply the daily PnL delta, record the exit, and (conditionally) latch the circuit breaker as three SEPARATE,
+// un-transacted ledger writes. A crash or genuine DB failure between any of those steps could leave the ledger and
+// the in-memory state permanently inconsistent. See TradeLedger.runExitTransaction / markReconciliationNeeded and
+// positionMonitor.ts:closePosition.
+// ---------------------------------------------------------------------------------------------------------------------
+describe('PositionMonitor: atomic exit persistence', () => {
+  it('a normal successful exit commits the trade exit, the daily PnL delta, and removes the position -- together', async () => {
+    const { monitor, ledger, emergencyStop } = setup([ok()]);
+    await poll(monitor);
+    expect(monitor.getOpenCount()).toBe(0);
+    expect(tradeRow(ledger).status).toBe('closed');
+    const dateIsoUtc = utcDateString(Date.now());
+    expect(ledger.getDailyRealizedPnl(dateIsoUtc)).toBeCloseTo(0.28 - 0.3, 12);
+    expect(emergencyStop.trigger).not.toHaveBeenCalled();
+  });
+
+  it('a DB failure during the atomic write leaves the position tracked (never deleted), the trade row still open, and no partial daily PnL', async () => {
+    const { monitor, ledger, emergencyStop } = setup([ok()]);
+    const dateIsoUtc = utcDateString(Date.now());
+    const before = ledger.getDailyRealizedPnl(dateIsoUtc);
+    const spy = vi.spyOn(ledger, 'runExitTransaction').mockImplementation(() => {
+      throw new Error('simulated disk full');
+    });
+
+    await poll(monitor);
+
+    expect(monitor.getOpenCount()).toBe(1); // NEVER deleted from tracking
+    expect(tradeRow(ledger).status).toBe('open'); // the write rolled back / never happened
+    expect(ledger.getDailyRealizedPnl(dateIsoUtc)).toBe(before); // no partial PnL update
+    expect(monitor.needsReconciliation('t1')).toBe(true);
+    expect(emergencyStop.trigger).toHaveBeenCalledTimes(1);
+    expect((emergencyStop.trigger as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toContain('exit_persistence_failed');
+    spy.mockRestore();
+  });
+
+  it('executed sell + DB failure => reconciliation-needed, and NEVER a duplicate sell on the next poll', async () => {
+    const { monitor, ledger, sells } = setup([ok(), ok()]); // a second, distinct successful fill queued -- must never be reached
+    vi.spyOn(ledger, 'runExitTransaction').mockImplementation(() => {
+      throw new Error('simulated disk full');
+    });
+    await poll(monitor);
+    expect(sells).toHaveLength(1);
+    await poll(monitor); // if reconciliationNeeded did not block this, the second queued fill would execute
+    await poll(monitor);
+    expect(sells).toHaveLength(1); // still exactly one sell attempt, ever
+    expect(monitor.getOpenCount()).toBe(1);
+  });
+
+  it('the ledger row itself is marked with a reconciliation reason, surviving a restart (see positionRecovery.ts)', async () => {
+    const { monitor, ledger } = setup([ok()]);
+    vi.spyOn(ledger, 'runExitTransaction').mockImplementation(() => {
+      throw new Error('simulated disk full');
+    });
+    await poll(monitor);
+    const row = ledger['db'].prepare(`SELECT reconciliation_reason FROM trades WHERE id = 't1'`).get() as { reconciliation_reason: string | null };
+    expect(row.reconciliation_reason).toContain('exit_persistence_failed');
+  });
+
+  it('circuit-breaker state stays consistent: a DB failure never latches it (nothing was committed to latch it against)', async () => {
+    const { monitor, ledger } = setup([ok({ filledAmountSol: 0 })]); // a large simulated loss, would breach the daily loss limit if committed
+    vi.spyOn(ledger, 'runExitTransaction').mockImplementation(() => {
+      throw new Error('simulated disk full');
+    });
+    await poll(monitor);
+    const dateIsoUtc = utcDateString(Date.now());
+    const state = ledger.getOrInitDailyRiskState(dateIsoUtc, cfg.risk.dailyStartingBalanceSol);
+    expect(state.circuitBreakerTriggered).toBe(false);
+  });
+
+  it('a restarted process reconciles safely: recovery sees the persisted reason and refuses to resume the trade automatically', async () => {
+    const { monitor, ledger, emergencyStop } = setup([ok()]);
+    vi.spyOn(ledger, 'runExitTransaction').mockImplementation(() => {
+      throw new Error('simulated disk full');
+    });
+    await poll(monitor);
+
+    // Simulate a fresh process: a brand-new PositionMonitor, wired to the SAME ledger.
+    const { recoverOpenPositions } = await import('../../src/orchestrator/positionRecovery.js');
+    const freshEmergencyStop = { isTriggered: () => false, trigger: vi.fn() } as never;
+    const executor = { buy: async () => { throw new Error('no'); }, sell: vi.fn() };
+    const priceSource = { getPrice: vi.fn(), getEstimatedPriceImpactPct: vi.fn(), getBuyExecutionQuote: vi.fn(), getSellPriceImpactPct: vi.fn() };
+    const aggregator = { getPrice: vi.fn(), getHolderConcentration: vi.fn(), getLiquidityAndVolume: vi.fn() };
+    const freshMonitor = new PositionMonitor(
+      { executor, priceSource: priceSource as never, aggregator: aggregator as never, ledger, emergencyStop: freshEmergencyStop, logger },
+      cfg,
+      HARD_RISK_PARAMETERS,
+    );
+    const result = recoverOpenPositions(ledger, freshMonitor, freshEmergencyStop, logger);
+    expect(result.reconciliationFlagged).toBe(1);
+    expect(freshMonitor.hasPosition('t1')).toBe(false); // never resumed as a live, tradeable position
+    expect(freshMonitor.needsReconciliation('t1')).toBe(true);
+    void emergencyStop;
+  });
+});

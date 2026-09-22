@@ -7,7 +7,7 @@ import type { Logger } from '../logging/logger.js';
 import type { EmergencyStop } from '../risk/emergencyStop.js';
 import { isDailyLossLimitBreached } from '../risk/dailyLossCircuitBreaker.js';
 import type { TradeLedger } from '../ledger/tradeLedger.js';
-import type { Position, PricePoint } from '../types/trade.js';
+import type { Position, PricePoint, TradeExitRecord } from '../types/trade.js';
 import { pctChange } from '../utils/math.js';
 import { utcDateString } from '../utils/time.js';
 import { computeRecentMomentumPct, computeRecentVolatilityPct } from './positionSignals.js';
@@ -42,10 +42,11 @@ export class PositionMonitor {
   private readonly deferredSince = new Map<string, number>();
   /**
    * Trade IDs whose sell outcome could not be confirmed as executed (a non-retryable "not executed" failure, an
-   * `'unknown'` outcome, or a retryable failure that never resolved within `MAX_SELL_DEFERRAL_MS`). The position
-   * stays open (counted, in the ledger, in `positions`) but is never polled/sold again automatically: a human must
+   * `'unknown'` outcome, a retryable failure that never resolved within `MAX_SELL_DEFERRAL_MS`), OR whose ledger
+   * row could not be safely recovered/persisted (see `markReconciliationNeeded`, orchestrator/positionRecovery.ts).
+   * The position stays open (counted, in the ledger) but is never polled/sold again automatically: a human must
    * reconcile the real state before this trade can safely resume. This is what prevents a future live executor
-   * from ever sending a DUPLICATE sell for a position whose first attempt's outcome is unknown.
+   * from ever sending a DUPLICATE sell for a position whose real state is unknown or unconfirmed.
    */
   private readonly reconciliationNeeded = new Set<string>();
   /** Retryable sell attempts that did not execute because an input was unavailable (observability). */
@@ -78,6 +79,11 @@ export class PositionMonitor {
     this.positions.set(position.tradeId, position);
   }
 
+  /** True once this trade is being actively monitored (used by positionRecovery.ts to stay idempotent). */
+  hasPosition(tradeId: string): boolean {
+    return this.positions.has(tradeId);
+  }
+
   getOpenCount(): number {
     return this.positions.size;
   }
@@ -87,6 +93,23 @@ export class PositionMonitor {
     return this.reconciliationNeeded.has(tradeId);
   }
 
+  /**
+   * Flags a trade so automatic selling is permanently blocked for it in this process, and trips the emergency stop.
+   * Used by:
+   *  - `handleUnexecutedSell` below, for a sell whose outcome could not be confirmed;
+   *  - orchestrator/positionRecovery.ts, for a ledger-open trade that cannot be safely reconstructed at startup
+   *    (missing critical data, or already carrying a persisted `reconciliation_reason`) -- called WITHOUT the
+   *    position ever having been added to `positions`, so it is flagged without ever being polled or sold.
+   * Idempotent: flagging an already-flagged trade only re-triggers the emergency stop (harmless -- `trigger` simply
+   * overwrites reason/timestamp) and is otherwise a no-op.
+   */
+  markReconciliationNeeded(tradeId: string, mint: string, reason: string, nowMs: number = Date.now()): void {
+    this.reconciliationNeeded.add(tradeId);
+    this.sellReconciliationEvents += 1;
+    this.deps.emergencyStop.trigger(reason, nowMs);
+    this.deps.logger.error({ mint, tradeId, reason }, 'trade flagged for manual reconciliation: automatic selling blocked');
+  }
+
   private async pollAll(): Promise<void> {
     const active = [...this.positions.values()];
     await Promise.all(active.map((position) => this.pollOne(position)));
@@ -94,9 +117,9 @@ export class PositionMonitor {
 
   private async pollOne(position: Position): Promise<void> {
     if (this.closing.has(position.tradeId)) return; // a sell for this position is already in flight
-    // A prior sell for this position could not be confirmed as executed: never attempt another sell for it
-    // automatically -- doing so risks a duplicate sell once a real executor is wired in. It stays open/counted
-    // until a human reconciles the real state (see `handleUnexecutedSell`).
+    // A prior sell for this position could not be confirmed as executed (or it could not be safely recovered at
+    // startup): never attempt another sell for it automatically -- doing so risks a duplicate sell once a real
+    // executor is wired in. It stays open/counted until a human reconciles the real state.
     if (this.reconciliationNeeded.has(position.tradeId)) return;
     try {
       const nowMs = Date.now();
@@ -105,28 +128,47 @@ export class PositionMonitor {
         this.deps.aggregator.getLiquidityAndVolume(position.mint),
       ]);
 
+      let recentMomentumPct = 0;
+      let recentVolatilityPct = 0;
+
       if (currentPriceSol === null) {
-        this.deps.logger.warn({ mint: position.mint, tradeId: position.tradeId }, 'position monitor: price unavailable');
-        return;
+        // Price unavailable: do NOT fabricate a price and do NOT reuse an old price as "current" -- but do NOT skip
+        // evaluation altogether either. evaluateExit() is called below regardless: emergency-stop and max-hold-
+        // timeout do not need a current price to begin with, and every condition that DOES need one is skipped
+        // safely INSIDE evaluateExit (currentPriceSol === null there), not here. This is what fixes the bug where a
+        // bare early `return` here used to skip emergency-stop and max-hold entirely whenever the price provider
+        // was unavailable, leaving a position that should have been force-closed sitting open indefinitely.
+        this.deps.logger.warn({ mint: position.mint, tradeId: position.tradeId }, 'position monitor: price unavailable; evaluating non-price exit conditions only');
+      } else {
+        // The liquidity value stored on the history point is a best-effort HISTORICAL annotation only (falls back
+        // to the last known reading when the aggregator has none this tick, same as before this fix) -- it is
+        // never read back as "current" anywhere. `currentLiquiditySol` below is sourced independently and honestly.
+        const point: PricePoint = {
+          priceSol: currentPriceSol,
+          liquiditySol: liquidityVolume?.liquiditySol ?? position.priceHistory.at(-1)?.liquiditySol ?? 0,
+          timestampMs: nowMs,
+        };
+        position.priceHistory.push(point);
+        position.peakPriceSol = Math.max(position.peakPriceSol, currentPriceSol);
+        position.troughPriceSol = Math.min(position.troughPriceSol, currentPriceSol);
+        recentMomentumPct = computeRecentMomentumPct(position.priceHistory, currentPriceSol, nowMs);
+        recentVolatilityPct = computeRecentVolatilityPct(position.priceHistory, position.entryPriceSol);
       }
 
-      const point: PricePoint = {
-        priceSol: currentPriceSol,
-        liquiditySol: liquidityVolume?.liquiditySol ?? position.priceHistory.at(-1)?.liquiditySol ?? 0,
-        timestampMs: nowMs,
-      };
-      position.priceHistory.push(point);
-      position.peakPriceSol = Math.max(position.peakPriceSol, currentPriceSol);
-      position.troughPriceSol = Math.min(position.troughPriceSol, currentPriceSol);
-
-      const recentMomentumPct = computeRecentMomentumPct(position.priceHistory, currentPriceSol, nowMs);
-      const recentVolatilityPct = computeRecentVolatilityPct(position.priceHistory, position.entryPriceSol);
+      // Current liquidity: null means "unavailable this tick", full stop -- never backfilled from priceHistory or
+      // any other stale reading. A stale substitution here could hide a real liquidity collapse from the
+      // deterioration check (see exit/exitEngine.ts, which skips that ONE condition, and only that one, when this
+      // is null). Independent of the price branch above: either can be available while the other is not.
+      const currentLiquiditySol: number | null = liquidityVolume?.liquiditySol ?? null;
+      if (currentLiquiditySol === null) {
+        this.deps.logger.warn({ mint: position.mint, tradeId: position.tradeId }, 'position monitor: current liquidity unavailable; liquidity-deterioration exit not evaluated this tick');
+      }
 
       const decision = evaluateExit(
         {
           position,
           currentPriceSol,
-          currentLiquiditySol: point.liquiditySol,
+          currentLiquiditySol,
           recentMomentumPct,
           recentVolatilityPct,
           nowMs,
@@ -168,9 +210,13 @@ export class PositionMonitor {
       return;
     }
 
-    this.deferredSince.delete(position.tradeId);
-    this.positions.delete(position.tradeId);
-
+    // From here the sell IS confirmed executed. Every write below is composed into ONE atomic ledger transaction
+    // (TradeLedger.runExitTransaction) and -- critically -- the position is NOT removed from `this.positions` until
+    // that transaction actually commits. The pre-fix code deleted it from tracking FIRST, then made three separate,
+    // un-transacted ledger writes: a crash or a genuine SQLite failure between any of those steps used to leave the
+    // ledger and in-memory state permanently inconsistent (exposure silently vanished from tracking while the
+    // ledger row was still 'open' with none of this recorded anywhere), with nothing left indicating a real sale
+    // had happened at all.
     const nowMs = fill.timestampMs;
     const pnlSol = fill.filledAmountSol - position.entrySizeSol;
     const pnlPct = (pnlSol / position.entrySizeSol) * 100;
@@ -178,44 +224,74 @@ export class PositionMonitor {
     const maePct = pctChange(position.entryPriceSol, position.troughPriceSol);
     const dateIsoUtc = utcDateString(nowMs);
 
-    const dailyState = this.deps.ledger.getOrInitDailyRiskState(dateIsoUtc, this.cfg.risk.dailyStartingBalanceSol);
-    this.deps.ledger.applyRealizedPnl(dateIsoUtc, pnlSol);
-    const updatedRealizedPnl = dailyState.realizedPnlSol + pnlSol;
+    let persisted: { updatedRealizedPnlSol: number; circuitBreakerLatched: boolean };
+    try {
+      persisted = this.deps.ledger.runExitTransaction(() => {
+        const dailyState = this.deps.ledger.getOrInitDailyRiskState(dateIsoUtc, this.cfg.risk.dailyStartingBalanceSol);
+        const updatedRealizedPnlSol = dailyState.realizedPnlSol + pnlSol;
+        this.deps.ledger.applyRealizedPnl(dateIsoUtc, pnlSol);
 
-    this.deps.ledger.recordExit(position.tradeId, {
-      exitTimeMs: nowMs,
-      exitPriceSol: fill.filledPriceSol,
-      exitReason: reason,
-      exitFeesSol: fill.feesSol,
-      exitTxSignature: fill.txSignature,
-      exitSlippagePct: fill.slippagePct,
-      holdDurationMs: nowMs - position.entryTimeMs,
-      pnlSol,
-      pnlPct,
-      maxFavorableExcursionPct: mfePct,
-      maxAdverseExcursionPct: maePct,
-      dailyRealizedPnlSolAtExit: updatedRealizedPnl,
-      exitContext: buildExitContext({
-        exitReason: reason,
-        exitObservedAtMs: nowMs,
-        entryPriceSol: position.entryPriceSol,
-        exitPriceSol: fill.filledPriceSol,
-        entrySizeSol: position.entrySizeSol,
-        entryFilledAmountSol: position.entryFilledAmountSol,
-        exitFilledAmountSol: fill.filledAmountSol,
-        entryFeesSol: position.entryFeesSol ?? null,
-        exitFeesSol: fill.feesSol,
-        sellPriceImpactPct: fill.priceImpactPct,
-        exitSlippagePct: fill.slippagePct,
-        holdDurationMs: nowMs - position.entryTimeMs,
-      }),
-    });
+        const exit: TradeExitRecord = {
+          exitTimeMs: nowMs,
+          exitPriceSol: fill.filledPriceSol,
+          exitReason: reason,
+          exitFeesSol: fill.feesSol,
+          exitTxSignature: fill.txSignature,
+          exitSlippagePct: fill.slippagePct,
+          holdDurationMs: nowMs - position.entryTimeMs,
+          pnlSol,
+          pnlPct,
+          maxFavorableExcursionPct: mfePct,
+          maxAdverseExcursionPct: maePct,
+          dailyRealizedPnlSolAtExit: updatedRealizedPnlSol,
+          exitContext: buildExitContext({
+            exitReason: reason,
+            exitObservedAtMs: nowMs,
+            entryPriceSol: position.entryPriceSol,
+            exitPriceSol: fill.filledPriceSol,
+            entrySizeSol: position.entrySizeSol,
+            entryFilledAmountSol: position.entryFilledAmountSol,
+            exitFilledAmountSol: fill.filledAmountSol,
+            entryFeesSol: position.entryFeesSol ?? null,
+            exitFeesSol: fill.feesSol,
+            sellPriceImpactPct: fill.priceImpactPct,
+            exitSlippagePct: fill.slippagePct,
+            holdDurationMs: nowMs - position.entryTimeMs,
+          }),
+        };
+        this.deps.ledger.recordExit(position.tradeId, exit);
 
-    if (isDailyLossLimitBreached(updatedRealizedPnl, dailyState.startingBalanceSol, this.hard.dailyLossLimitPct)) {
-      this.deps.ledger.latchCircuitBreaker(dateIsoUtc, nowMs);
-      this.deps.logger.warn({ dateIsoUtc, updatedRealizedPnl }, 'daily loss circuit breaker latched');
+        const circuitBreakerLatched = isDailyLossLimitBreached(updatedRealizedPnlSol, dailyState.startingBalanceSol, this.hard.dailyLossLimitPct);
+        if (circuitBreakerLatched) this.deps.ledger.latchCircuitBreaker(dateIsoUtc, nowMs);
+
+        return { updatedRealizedPnlSol, circuitBreakerLatched };
+      });
+    } catch (err) {
+      // The sell ALREADY executed (confirmed above), but committing that to the ledger failed. A real sale must
+      // never look "still open and untouched" (the position stays tracked, exposure stays counted -- nothing about
+      // its accounting is lost), and it must never be sold AGAIN automatically (that would risk a duplicate sell
+      // against a position that no longer exists on-chain). `markReconciliationNeeded` persists a reason on the
+      // ledger row too, so a restart never silently resumes trading this trade either (see positionRecovery.ts).
+      const reasonText = `exit_persistence_failed:${String(err)}`;
+      try {
+        this.deps.ledger.markReconciliationNeeded(position.tradeId, reasonText, nowMs);
+      } catch (markErr) {
+        this.deps.logger.error({ tradeId: position.tradeId, err: String(markErr) }, 'position monitor: failed to persist the reconciliation marker itself after an exit-persistence failure');
+      }
+      this.markReconciliationNeeded(position.tradeId, position.mint, reasonText, nowMs);
+      this.deps.logger.error(
+        { mint: position.mint, tradeId: position.tradeId, err: String(err), fillTxSignature: fill.txSignature },
+        'sell executed but the ledger exit write failed: position left tracked (never deleted, never fabricated) and blocked from further automatic selling pending manual reconciliation',
+      );
+      return; // this.positions still holds it -- nothing is removed on this path
     }
 
+    this.deferredSince.delete(position.tradeId);
+    this.positions.delete(position.tradeId);
+
+    if (persisted.circuitBreakerLatched) {
+      this.deps.logger.warn({ dateIsoUtc, updatedRealizedPnl: persisted.updatedRealizedPnlSol }, 'daily loss circuit breaker latched');
+    }
     this.deps.logger.info(
       { mint: position.mint, tradeId: position.tradeId, reason, pnlSol, pnlPct },
       'position closed',

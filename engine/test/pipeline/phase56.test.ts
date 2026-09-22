@@ -96,6 +96,9 @@ describe('1/2. sell-side price impact is its own calculation (Phase 5.6)', () =>
     const sim = new CurveSim();
     f.create(mintId(3), BASE_TS + 100);
     f.curveTrade(mintId(3), sim.buy(8_000_000_000n), BASE_TS + 150);
+    // A second, small trade close to the query time keeps the curve within the default 5 s per-token freshness
+    // bound (see the P1 fix in pumpfunVolumeEngine.ts:resolveCurve).
+    f.curveTrade(mintId(3), sim.buy(100_000_000n), BASE_TS + 200);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const s = f.engine.getNativeMarketSnapshot(mintId(3), 0.3, at(BASE_TS + 201));
     expect(s.priceImpactPct).not.toBeNull();
