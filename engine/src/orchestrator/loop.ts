@@ -27,6 +27,7 @@ import type { ProviderMetrics } from '../providers/providerMetrics.js';
 import { MAX_QUOTE_AGE_MS } from '../execution/jupiterQuoteClient.js';
 import { runShutdown } from '../lifecycle/shutdown.js';
 import { EntryReservations, EvaluationGuard, type EvaluationLease } from './evaluationGuard.js';
+import { EvaluationScheduler } from './evaluationScheduler.js';
 import { decideMarketSource } from './marketSourcePolicy.js';
 import { nativeVenueFeeBps } from './nativeFirst.js';
 import { buildEntryContext } from './decisionContext.js';
@@ -104,6 +105,13 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
   // against the existing limits from the moment risk allows them, not from the moment they are recorded.
   const guard = new EvaluationGuard(deps.evaluationTimeoutMs ?? 30_000);
   const reservations = new EntryReservations();
+  // Phase 5.6O: global evaluation backpressure, derived from ProviderGate's own RPC concurrency (see
+  // evaluationScheduler.ts and docs/PHASE_5_6N_PROVIDERGATE_SATURATION_INVESTIGATION.md). Each safety-gate-reaching
+  // evaluation makes its RPC calls SEQUENTIALLY (never more than one in flight at a time for that evaluation), so
+  // bounding concurrent evaluations at the gate's own maxConcurrent guarantees the orchestrator never offers the
+  // gate more simultaneous RPC demand than it can service without queueing -- no evaluation ever needs to wait in
+  // ProviderGate's own waiter queue for a slot. Never below 1.
+  const scheduler = new EvaluationScheduler({ maxConcurrent: Math.max(1, cfg.providers.rpc.maxConcurrent) });
 
   const positionMonitor = new PositionMonitor(
     { executor: deps.executor, priceSource: deps.priceSource, aggregator: deps.aggregator, ledger: deps.ledger, emergencyStop, logger: deps.logger },
@@ -118,6 +126,7 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
       clearInterval(handle.timer);
       watched.delete(mint);
       history.clear(mint);
+      scheduler.forget(mint); // a token no longer watched must never consume a future global evaluation slot
     }
   }
 
@@ -718,9 +727,12 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
 
   function watchToken(event: DiscoveredTokenEvent): void {
     if (stopping || watched.has(event.mint)) return;
-    const timer = setInterval(() => void evaluateToken(event), EVAL_INTERVAL_MS);
+    // Every tick goes through the global scheduler first (Phase 5.6O), never straight into evaluateToken(): under
+    // normal load this is transparent (a free slot is always available so the tick runs immediately, identical to
+    // before); only under sustained overload does it coalesce/defer rather than adding to ProviderGate's own queue.
+    const timer = setInterval(() => scheduler.requestTick(event.mint, () => evaluateToken(event)), EVAL_INTERVAL_MS);
     watched.set(event.mint, { timer, event });
-    void evaluateToken(event);
+    scheduler.requestTick(event.mint, () => evaluateToken(event));
   }
 
   for (const source of deps.discoverySources) {
@@ -737,6 +749,7 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
     for (const mint of [...watched.keys()]) {
       stopWatching(mint);
     }
+    scheduler.stop(); // refuses any further dispatch; already-active evaluations are left to finish (bounded by their own timeouts)
     positionMonitor.stop();
     const stepMs = deps.shutdownStepTimeoutMs ?? 4000;
     const reports = await runShutdown(
