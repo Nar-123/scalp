@@ -8,6 +8,7 @@ import { MIGRATION_003_ADDITIVE_COLUMNS, MIGRATION_003_SHADOW_TABLES } from './m
 import { MIGRATION_004_PUMPFUN_EVENTS } from './migrations/004_pumpfun_trade_events.js';
 import { MIGRATION_007_PROVIDER_METRICS } from './migrations/007_provider_metrics.js';
 import { MIGRATION_008_PRICE_PATHS } from './migrations/008_price_paths.js';
+import { MIGRATION_009_RELIABILITY_COLUMNS, MIGRATION_009_RELIABILITY_TABLE } from './migrations/009_reliability_columns.js';
 import {
   MIGRATION_006_EVALUATIONS,
   MIGRATION_006_EVALUATIONS_TABLE,
@@ -58,6 +59,7 @@ export function openLedger(dbPath: string): DatabaseSyncType {
   applyAdditiveColumns(db, MIGRATION_006_EVALUATIONS_TABLE, MIGRATION_006_EVALUATIONS);
   db.exec(MIGRATION_007_PROVIDER_METRICS);
   db.exec(MIGRATION_008_PRICE_PATHS);
+  applyAdditiveColumns(db, MIGRATION_009_RELIABILITY_TABLE, MIGRATION_009_RELIABILITY_COLUMNS);
   db.prepare(
     `INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,

@@ -20,17 +20,32 @@ export function classifyRpcEndpoint(url: string): 'public_keyless' | 'configured
 
 type RpcCfg = Pick<AppConfig, 'rpc' | 'providers'>;
 
-/** Endpoint list for the RPC gate: the primary first, then the explicitly configured fallbacks, in order. */
+/**
+ * Endpoint list for the RPC gate: the primary first, then the explicitly configured fallbacks, in order.
+ *
+ * P1 credential-isolation fix: `cfg.providers.rpc.apiKey` is a credential for the PRIMARY endpoint only -- it used
+ * to be attached to every endpoint returned here, including every fallback, which meant a fallback provider
+ * (potentially a different company entirely) silently received the primary provider's API key on every request. A
+ * fallback now gets no credential at all unless one is explicitly configured for THAT fallback, index-aligned via
+ * `fallbackApiKeys` (empty/absent entries mean "no credential for this endpoint", never "reuse the primary's").
+ */
 export function rpcEndpoints(cfg: RpcCfg): ProviderEndpoint[] {
-  const headers = cfg.providers.rpc.apiKey ? { 'x-api-key': cfg.providers.rpc.apiKey } : undefined;
-  const urls = [cfg.rpc.httpUrl, ...cfg.providers.rpc.fallbackUrls];
-  return urls.map((baseUrl) => ({ baseUrl, ...(headers ? { headers } : {}) }));
+  const r = cfg.providers.rpc;
+  return [endpointWithOwnCredential(cfg.rpc.httpUrl, r.apiKey), ...fallbackEndpoints(r.fallbackUrls, r.fallbackApiKeys)];
 }
 
+/** Same isolation rule as `rpcEndpoints`, for the quote (Jupiter) gate's primary + configured fallbacks. */
 export function quoteEndpoints(cfg: Pick<AppConfig, 'aggregators' | 'providers'>): ProviderEndpoint[] {
-  const headers = cfg.providers.quote.apiKey ? { 'x-api-key': cfg.providers.quote.apiKey } : undefined;
-  const urls = [cfg.aggregators.jupiterQuoteBaseUrl, ...cfg.providers.quote.fallbackUrls];
-  return urls.map((baseUrl) => ({ baseUrl, ...(headers ? { headers } : {}) }));
+  const q = cfg.providers.quote;
+  return [endpointWithOwnCredential(cfg.aggregators.jupiterQuoteBaseUrl, q.apiKey), ...fallbackEndpoints(q.fallbackUrls, q.fallbackApiKeys)];
+}
+
+function endpointWithOwnCredential(baseUrl: string, apiKey: string | undefined): ProviderEndpoint {
+  return apiKey ? { baseUrl, headers: { 'x-api-key': apiKey } } : { baseUrl };
+}
+
+function fallbackEndpoints(urls: readonly string[], apiKeys: readonly string[]): ProviderEndpoint[] {
+  return urls.map((baseUrl, i) => endpointWithOwnCredential(baseUrl, apiKeys[i] || undefined));
 }
 
 /** A `fetch` for web3.js that sends every JSON-RPC HTTP call through the gate (limits, retries, fallback, shutdown). */
@@ -72,6 +87,8 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
   for (const url of [cfg.rpc.httpUrl, ...cfg.providers.rpc.fallbackUrls, cfg.aggregators.jupiterQuoteBaseUrl, ...cfg.providers.quote.fallbackUrls]) for (const s of secretsInUrl(url)) registerSecret(s);
   registerSecret(cfg.providers.rpc.apiKey);
   registerSecret(cfg.providers.quote.apiKey);
+  for (const k of cfg.providers.rpc.fallbackApiKeys) registerSecret(k);
+  for (const k of cfg.providers.quote.fallbackApiKeys) registerSecret(k);
 
   const metrics = new ProviderMetrics();
   const r = cfg.providers.rpc;

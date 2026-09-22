@@ -176,4 +176,84 @@ describe('TradeLedger', () => {
     expect(history.lastTradeExitTimeMs).toBeNull();
     expect(history.consecutiveLosses).toBe(0);
   });
+
+  it('persists entryFilledAmountSol (P1 position-recovery fix) and reads it back via getRecoverableOpenPositions', () => {
+    ledger.recordEntry(makeEntry({ entryFilledAmountSol: 0.29 }));
+    const [open] = ledger.getRecoverableOpenPositions();
+    expect(open!.entryFilledAmountSol).toBe(0.29);
+    expect(open!.entryTokenAmountRaw).toBeNull(); // not set in makeEntry() by default
+  });
+
+  it('a trade recorded WITHOUT entryFilledAmountSol reads back null, never a fabricated 0', () => {
+    ledger.recordEntry(makeEntry()); // entryFilledAmountSol omitted entirely
+    const [open] = ledger.getRecoverableOpenPositions();
+    expect(open!.entryFilledAmountSol).toBeNull();
+  });
+
+  it('getRecoverableOpenPositions only returns open trades, with every field getOpenPositions does not expose', () => {
+    ledger.recordEntry(makeEntry({ id: 'open1', entryTokenAmountRaw: '123456', entryFilledAmountSol: 0.29, poolAddress: 'POOL' }));
+    ledger.recordEntry(makeEntry({ id: 'closed1' }));
+    ledger.recordExit('closed1', makeExit());
+    const open = ledger.getRecoverableOpenPositions();
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({
+      tradeId: 'open1',
+      mint: 'MINT',
+      poolAddress: 'POOL',
+      entryTokenAmountRaw: '123456',
+      entryFilledAmountSol: 0.29,
+      reconciliationReason: null,
+    });
+  });
+
+  it('markReconciliationNeeded persists a reason, keeps the trade open, and the FIRST reason wins on repeated calls', () => {
+    ledger.recordEntry(makeEntry());
+    ledger.markReconciliationNeeded('trade_1', 'first reason');
+    ledger.markReconciliationNeeded('trade_1', 'second reason'); // must not overwrite
+    const [open] = ledger.getRecoverableOpenPositions();
+    expect(open!.reconciliationReason).toBe('first reason');
+    expect(ledger.getOpenPositions()).toHaveLength(1); // still open, still counted for exposure
+  });
+
+  it('runExitTransaction: every write inside the callback commits together on success', () => {
+    ledger.recordEntry(makeEntry());
+    const result = ledger.runExitTransaction(() => {
+      ledger.getOrInitDailyRiskState('2026-01-01', 10);
+      ledger.applyRealizedPnl('2026-01-01', -0.02);
+      ledger.recordExit('trade_1', makeExit({ pnlSol: -0.02 }));
+      return 'done';
+    });
+    expect(result).toBe('done');
+    expect(ledger.getOpenPositions()).toHaveLength(0);
+    expect(ledger.getDailyRealizedPnl('2026-01-01')).toBeCloseTo(-0.02, 10);
+  });
+
+  it('runExitTransaction: a thrown error rolls back EVERY write in the callback -- none of them land', () => {
+    ledger.recordEntry(makeEntry());
+    ledger.getOrInitDailyRiskState('2026-01-01', 10); // pre-existing row, so we can prove its value is untouched
+    expect(() =>
+      ledger.runExitTransaction(() => {
+        ledger.applyRealizedPnl('2026-01-01', -0.02);
+        ledger.recordExit('trade_1', makeExit({ pnlSol: -0.02 }));
+        throw new Error('simulated failure after two writes');
+      }),
+    ).toThrow('simulated failure after two writes');
+    // Neither write committed: the trade is still open, and the daily PnL was never touched.
+    expect(ledger.getOpenPositions()).toHaveLength(1);
+    expect(ledger.getDailyRealizedPnl('2026-01-01')).toBe(0);
+  });
+
+  it('runExitTransaction: the ledger remains fully usable for a subsequent call after a rolled-back transaction', () => {
+    ledger.recordEntry(makeEntry());
+    expect(() =>
+      ledger.runExitTransaction(() => {
+        throw new Error('boom');
+      }),
+    ).toThrow('boom');
+    // A normal write afterwards must still work -- the rollback did not leave the connection in a bad state.
+    ledger.runExitTransaction(() => {
+      ledger.recordExit('trade_1', makeExit());
+    });
+    expect(ledger.getOpenPositions()).toHaveLength(0);
+  });
 });

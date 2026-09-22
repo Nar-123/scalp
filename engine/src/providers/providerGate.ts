@@ -420,8 +420,15 @@ export class ProviderGate {
     const slot = Math.max(t, st.nextSlotAt);
     if (slot >= deadline) return false;
     st.nextSlotAt = slot + spacing;
-    if (slot > t) await this.sleep(slot - t, signal);
+    // Tracks whether THIS call actually waited on something (rate-limit spacing or a concurrency slot) -- see the
+    // P2 near-deadline check below, which only applies when it did.
+    let waited = false;
+    if (slot > t) {
+      waited = true;
+      await this.sleep(slot - t, signal);
+    }
     if (st.active >= this.o.maxConcurrent) {
+      waited = true;
       const remaining = deadline - this.now();
       if (remaining <= 0) return false;
       const got = await new Promise<boolean>((resolve) => {
@@ -439,6 +446,22 @@ export class ProviderGate {
       });
       if (!got || signal.aborted) return false;
     }
+    // P2 near-deadline fix: a slot is only worth taking if a NORMAL attempt -- the full configured per-attempt
+    // timeout -- can still fit before this logical request's own deadline. Gated on `waited`: an UNCONTENDED
+    // request (no rate-limit spacing, no concurrency queueing) reaches here within microseconds of `execute()`
+    // capturing its deadline, and must never be rejected over ordinary JS-engine/event-loop timing noise -- a
+    // config with `timeoutMs === maxTotalMs` (give one attempt the whole budget, no room for retries) is
+    // legitimate and must still work. It is specifically a request that WAITED for local capacity -- the scenario
+    // the bug describes -- whose remaining budget can legitimately shrink below a full attempt-timeout. Without
+    // this check, that near-deadline slot would hand `tryEndpoint` a TRUNCATED timeout budget (see `Math.min(
+    // this.o.timeoutMs, deadline - t0)` there): a slow but perfectly healthy upstream response then looks exactly
+    // like a genuine provider timeout, incrementing `consecutiveFailures` and potentially opening the circuit from
+    // what was really just local scheduling pressure. That is LOCAL capacity exhaustion, not evidence of an
+    // unhealthy endpoint: refusing the slot here routes it through the exact same `not_attempted` path (see
+    // `EndpointOutcome`, Phase 5.6J) as every other "no slot in time" rejection -- `gateCapacityRejected`
+    // increments, `consecutiveFailures` and the circuit breaker are untouched. A genuine HTTP timeout that DID get
+    // its full configured budget is unaffected.
+    if (waited && deadline - this.now() < this.o.timeoutMs) return false;
     st.active += 1;
     return true;
   }

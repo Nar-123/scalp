@@ -19,6 +19,7 @@ import { genId } from '../utils/math.js';
 import { utcDateString } from '../utils/time.js';
 import { MarketHistoryTracker } from './marketHistory.js';
 import { PositionMonitor } from './positionMonitor.js';
+import { recoverOpenPositions } from './positionRecovery.js';
 import type { ShadowRunner } from '../shadow/shadowRunner.js';
 import type { QuoteObservation, ShadowMarketTick } from '../shadow/types.js';
 import type { NativeMarketProvider, NativeMarketSnapshot, OneMinuteVolumeProvider } from '../volume/types.js';
@@ -118,6 +119,13 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
     cfg,
     HARD_RISK_PARAMETERS,
   );
+  // Recovery MUST run before start(): once the poll loop is ticking, a position that should have been reconstructed
+  // from the ledger but isn't yet would simply never be evaluated for exit conditions until the next full recovery
+  // pass (which never happens again this process) -- exactly the bug this fixes (see positionRecovery.ts).
+  const recovery = recoverOpenPositions(deps.ledger, positionMonitor, emergencyStop, deps.logger);
+  if (recovery.recovered > 0 || recovery.reconciliationFlagged > 0) {
+    deps.logger.info(recovery, 'position recovery complete');
+  }
   positionMonitor.start();
 
   function stopWatching(mint: string): void {
@@ -655,6 +663,9 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
             entrySafetyCheckId: evaluationId,
             dailyRealizedPnlSolAtEntry: dailyState.realizedPnlSol,
             entryTokenAmountRaw: fill.tokenAmountRaw ?? null,
+            // P1 position-recovery fix: persisted so a restart can reconstruct this exact Position from the ledger
+            // (see orchestrator/positionRecovery.ts) without ever having to guess the SOL actually deployed.
+            entryFilledAmountSol: fill.filledAmountSol,
             entryContext: buildEntryContext({
               strategyVersion: cfg.strategyVersion,
               mint: event.mint,

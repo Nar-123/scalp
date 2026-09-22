@@ -32,11 +32,14 @@ function launch(f: Feed, mint: string, createdTs: number, trades: Array<{ ts: nu
 describe('native market snapshot (one coherent, single-source observation)', () => {
   it('G/I/J/K: price, liquidity and exact 0.3 SOL price impact come from the LATEST curve state', () => {
     const f = healthy();
+    // A final small trade at +200 keeps M within the default 5 s per-token freshness bound of the +201 query (see
+    // the P1 fix in resolveCurve) -- it is now the last trade that changed the curve, so stateEventSec reflects it.
     const sim = launch(f, M, BASE_TS + 100, [
       { ts: BASE_TS + 110, buySol: 1.0 },
       { ts: BASE_TS + 130, buySol: 2.5 },
       { ts: BASE_TS + 160, sellTokens: 20_000_000_000_000n },
       { ts: BASE_TS + 190, buySol: 0.6 },
+      { ts: BASE_TS + 200, buySol: 0.05 },
     ]);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 201));
@@ -49,7 +52,7 @@ describe('native market snapshot (one coherent, single-source observation)', () 
     const net = entryNetLamports(300_000_000n, 95, 30);
     expect(s.priceImpactPct).toBeCloseTo(buyPriceImpactPct({ virtualSolReserves: sim.vs, virtualTokenReserves: sim.vt, realTokenReserves: sim.rt }, net)!, 12);
     expect(s.curve).toMatchObject({ virtualSolReserves: sim.vs.toString(), realSolReserves: sim.rs.toString(), feeBasisPoints: 95, creatorFeeBasisPoints: 30 });
-    expect(s.stateEventSec).toBe(BASE_TS + 190); // the last trade that changed the curve
+    expect(s.stateEventSec).toBe(BASE_TS + 200); // the last trade that changed the curve
     expect(s.marketDataAsOfSec).toBe(BASE_TS + 201); // the stream watermark
     expect(s.volumeWindowEndSec).toBe(BASE_TS + 200);
     expect(s.skewSec).toBe(1);
@@ -57,12 +60,16 @@ describe('native market snapshot (one coherent, single-source observation)', () 
 
   it('U: volume, acceleration, buy/sell ratio and tx count come from the same engine windows', () => {
     const f = healthy();
+    // A final trade at +200 keeps M within the default 5 s freshness bound of the +201 query. It lands inside the
+    // SAME current window (141..200) as the other current-window trades, so it is a 4th counted trade (3 buys / 1
+    // sell) -- txCount1m/buySellRatio below reflect that honestly, updated from the pre-fix numbers.
     launch(f, M, BASE_TS + 100, [
       { ts: BASE_TS + 110, buySol: 2 }, // previous window (T-119..T-60 = 81..140)
       { ts: BASE_TS + 130, buySol: 2 },
       { ts: BASE_TS + 150, buySol: 3 }, // current window (141..200)
       { ts: BASE_TS + 160, buySol: 3 },
       { ts: BASE_TS + 170, sellTokens: 50_000_000_000_000n },
+      { ts: BASE_TS + 200, buySol: 1 },
     ]);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 201));
@@ -70,32 +77,52 @@ describe('native market snapshot (one coherent, single-source observation)', () 
     expect(s.volume1mSol).toBe(v.volume1mSol);
     expect(s.volumeAccelerationX).toBe(v.volumeAccelerationX);
     expect(s.previousVolume1mSol).toBe(v.previousVolume1mSol);
-    expect(s.txCount1m).toBe(3);
-    expect(s.buySellRatio).toBe(2); // 2 buys / 1 sell (counts, like the DexScreener path)
+    expect(s.txCount1m).toBe(4);
+    expect(s.buySellRatio).toBe(3); // 3 buys / 1 sell (counts, like the DexScreener path)
     expect(s.volumeCoverage.status).toBe('COMPLETE');
     expect(s.volumeAccelerationX).toBeGreaterThan(0);
   });
 
   it('buy/sell ratio: only buys => +Infinity (degenerate_ratio path), only sells => 0, no trades => null (unavailable)', () => {
+    // Queries close to whichever trade is actually LAST for each case (within the default 5 s freshness bound),
+    // instead of a single fixed +201 shared by all three -- the original shared query time left M's curve up to
+    // 100 s stale for the (0,0) case, which this file's P1 per-token freshness fix now (correctly) catches.
+    // healthy(until) paces the pacer mint through `until` BEFORE any of M's trades below, so the watermark ends up
+    // at `until` regardless of M's own timestamps; keeping `until` close to M's last real trade is what keeps M
+    // fresh.
     const only = (buys: number, sells: number): NativeMarketSnapshot => {
-      const f = healthy();
+      const lastTradeTs = buys > 0 ? BASE_TS + 150 + buys - 1 : sells > 0 ? BASE_TS + 160 + sells - 1 : BASE_TS + 101;
+      // (0,0) is deliberately queried far (100 s) from its only (establishing) trade -- see the comment below on
+      // that case: it must stay genuinely stale, not be nudged fresh, or it stops proving "zero trades" at all.
+      const queryTs = buys === 0 && sells === 0 ? lastTradeTs + 100 : lastTradeTs + 2; // well within the 5 s bound
+      const f = healthy(queryTs);
       const sim = new CurveSim();
       f.create(M, BASE_TS + 100);
       f.curveTrade(M, sim.buy(3_000_000_000n), BASE_TS + 101); // establishes the curve long before the window
       for (let i = 0; i < buys; i += 1) f.curveTrade(M, sim.buy(100_000_000n), BASE_TS + 150 + i);
       for (let i = 0; i < sells; i += 1) f.curveTrade(M, sim.sell(1_000_000_000_000n), BASE_TS + 160 + i);
-      f.pace(BASE_TS + 201, BASE_TS + 201);
-      return f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 201));
+      return f.engine.getNativeMarketSnapshot(M, ENTRY, at(queryTs));
     };
     expect(only(3, 0).buySellRatio).toBe(Number.POSITIVE_INFINITY);
     expect(only(0, 2).buySellRatio).toBe(0);
-    expect(only(0, 0).buySellRatio).toBeNull();
-    expect(only(0, 0).volume1mSol).toBe(0); // healthy zero volume stays 0, but the ratio is undefined
+    // 0 buys/0 sells cannot be fixed the same way as the two cases above: "prove zero trades in the last 60 s" and
+    // "the curve's last trade is within the freshness bound" are LOGICALLY incompatible for a single-trade curve --
+    // a trade recent enough to be fresh is, by definition, inside the current 60 s window, and a trade old enough
+    // to be excluded from it is far outside any reasonable freshness bound. There is no fixture fix for this one:
+    // a token that provably has not traded in 60+ s is exactly the "gone quiet" case this file's P1 per-token
+    // freshness fix exists to catch, so the correct answer is TIMESTAMP_SKEW, not "VALID with an undefined ratio".
+    const noTrades = only(0, 0);
+    expect(noTrades.quality).toBe('TIMESTAMP_SKEW');
+    expect(noTrades.buySellRatio).toBeNull();
+    expect(noTrades.volume1mSol).toBeNull();
   });
 
   it('L: an entry that would exhaust the curve has no price impact (null), while price and liquidity stay valid', () => {
     const f = healthy();
-    const sim = launch(f, M, BASE_TS + 100, [{ ts: BASE_TS + 110, buySol: 1 }]);
+    // A second, negligible trade close to the query time keeps the curve state FRESH (see the P1 per-token
+    // freshness fix in resolveCurve) without materially changing the reserves the exhaustion/impact assertions
+    // below read -- `sim` reflects both trades, so they stay self-consistent with whatever the curve actually is.
+    const sim = launch(f, M, BASE_TS + 100, [{ ts: BASE_TS + 110, buySol: 1 }, { ts: BASE_TS + 200, buySol: 0.0001 }]);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const s = f.engine.getNativeMarketSnapshot(M, 10_000, at(BASE_TS + 201)); // 10,000 SOL >> the tokens left
     expect(s.quality).toBe('VALID');
@@ -178,9 +205,15 @@ describe('native market snapshot (one coherent, single-source observation)', () 
     launch(f, M, BASE_TS + 100, [{ ts: BASE_TS + 150, buySol: 2 }]);
     const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 200));
     expect(s).toMatchObject({ quality: 'TIMESTAMP_SKEW', reason: 'timestamp_skew', priceSol: null, liquiditySol: null, volume1mSol: null });
-    expect(s.skewSec).toBe(1);
-    const ok = healthy(BASE_TS + 200, { maxSnapshotSkewSec: 5 });
-    launch(ok, M, BASE_TS + 100, [{ ts: BASE_TS + 150, buySol: 2 }]);
+    // With maxSnapshotSkewSec: 0, the P1 per-token freshness check (M's own last trade, ts=150, is 50s behind the
+    // watermark) now rejects inside resolveCurve BEFORE the snapshot-specific volume-window `skewSec` (which would
+    // have been 1) is ever computed -- see the 'G/I/J/K' test above for that value still being reported when the
+    // per-token check does NOT fire first (a fresh curve, well under the default 5 s bound).
+    expect(s.skewSec).toBeNull();
+    // The DEFAULT bound (5 s, unchanged production value): a fresh curve is VALID. A trade close to the query time
+    // (instead of the original, now-stale ts=150) is what makes it fresh -- the bound itself is not widened.
+    const ok = healthy(BASE_TS + 200);
+    launch(ok, M, BASE_TS + 100, [{ ts: BASE_TS + 150, buySol: 2 }, { ts: BASE_TS + 199, buySol: 0.01 }]);
     expect(ok.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 200)).quality).toBe('VALID');
   });
 
@@ -192,9 +225,15 @@ describe('native market snapshot (one coherent, single-source observation)', () 
     const b = sim.buy(500_000_000n);
     f.curveTrade(M, b, BASE_TS + 150, {}, 777_000); // the LATER trade arrives first...
     f.curveTrade(M, a, BASE_TS + 150, {}, 777_000); // ...then its predecessor, in the SAME slot
+    // A normal follow-up trade at +200 keeps M within the default 5 s freshness bound of the +201 query; it chains
+    // forward from b's (the true latest) reserves, so `sim` after it is still the correct on-chain state to assert.
+    // Slot must be >= b/a's pinned 777_000 (a lower slot, like the Feed's own auto-incrementing default, would be
+    // read as a stale/out-of-order event and discarded, exactly like `curveStaleEvents` above).
+    const c = sim.buy(200_000_000n);
+    f.curveTrade(M, c, BASE_TS + 200, {}, 777_001);
     f.pace(BASE_TS + 201, BASE_TS + 201);
     const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 201));
-    expect(s.priceSol).toBeCloseTo(spotPriceSol(sim.vs, sim.vt)!, 18); // state = after b (the true latest)
+    expect(s.priceSol).toBeCloseTo(spotPriceSol(sim.vs, sim.vt)!, 18); // state = after b, then c (the true latest)
     const missing = healthy();
     const breaksBefore = missing.engine.stats.curveChainBreaks; // the pacer mint's own (inconsistent) events are counted too
     const linksBefore = missing.engine.stats.curveChainLinks;
@@ -245,7 +284,8 @@ describe('the new-token flow (no DexScreener pair)', () => {
   it('created -> ~50 s old -> still on the curve -> native price/liquidity/impact + native volume -> V1 filters EXECUTE on real values', () => {
     const f = new Feed();
     f.pace(BASE_TS, BASE_TS + 189);
-    // token created at +140, evaluated when 50 s old; 24 SOL raised, mostly buys, plenty in the last minute
+    // token created at +140, evaluated when 50 s old; 24 SOL raised, mostly buys, plenty in the last minute. A
+    // final trade at +189 keeps M within the default 5 s freshness bound of the +190 query.
     const sim = launch(f, M, BASE_TS + 140, [
       { ts: BASE_TS + 141, buySol: 4 },
       { ts: BASE_TS + 150, buySol: 6 },
@@ -253,6 +293,7 @@ describe('the new-token flow (no DexScreener pair)', () => {
       { ts: BASE_TS + 165, sellTokens: 30_000_000_000_000n },
       { ts: BASE_TS + 170, buySol: 6 },
       { ts: BASE_TS + 180, buySol: 5 },
+      { ts: BASE_TS + 189, buySol: 0.5 },
     ]);
     f.pace(BASE_TS + 190, BASE_TS + 190);
     const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 190));
@@ -273,7 +314,9 @@ describe('the new-token flow (no DexScreener pair)', () => {
   it('K/L: with the thresholds unchanged, thin tokens FAIL on their real values (liquidity < 20 SOL, volume < 5 SOL)', () => {
     const f = new Feed();
     f.pace(BASE_TS, BASE_TS + 189);
-    launch(f, M, BASE_TS + 140, [{ ts: BASE_TS + 150, buySol: 1.5 }, { ts: BASE_TS + 170, buySol: 1.0 }]);
+    // A tiny final trade at +189 keeps M fresh (default 5 s bound) without pushing this thin token over either
+    // minimum -- it still fails on both, as intended.
+    launch(f, M, BASE_TS + 140, [{ ts: BASE_TS + 150, buySol: 1.5 }, { ts: BASE_TS + 170, buySol: 1.0 }, { ts: BASE_TS + 189, buySol: 0.01 }]);
     f.pace(BASE_TS + 190, BASE_TS + 190);
     const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 190));
     const failures = collectBaselineFilterFailures({ liquiditySol: s.liquiditySol as number, volume1mSol: s.volume1mSol, buySellRatio: s.buySellRatio }, 5, s.volumeAccelerationX, s.priceImpactPct, getDefaultConfig());
@@ -298,7 +341,8 @@ describe('the new-token flow (no DexScreener pair)', () => {
 describe('consumers other than the loop follow the same priority (native-first wrappers)', () => {
   it('VALID -> native; graduated/unobserved -> delegate; still-on-curve-but-unproven -> null, inner never called', async () => {
     const f = healthy();
-    const sim = launch(f, M, BASE_TS + 100, [{ ts: BASE_TS + 150, buySol: 22 }]);
+    // A final small trade at +200 keeps M within the default 5 s freshness bound of the +201 query below.
+    const sim = launch(f, M, BASE_TS + 100, [{ ts: BASE_TS + 150, buySol: 22 }, { ts: BASE_TS + 200, buySol: 0.01 }]);
     f.create(mintId(6), BASE_TS + 100); // created, no trade: no curve state
     launch(f, mintId(7), BASE_TS + 100, [{ ts: BASE_TS + 150, buySol: 2 }]);
     f.graduate(mintId(7), BASE_TS + 160);
@@ -330,5 +374,84 @@ describe('consumers other than the loop follow the same priority (native-first w
     expect(await price.getPrice(mintId(4321))).toBe(0.123); // never observed on the curve stream: delegated
     expect(innerCalls).toBe(2);
     expect(await agg.getHolderConcentration(M)).toBeNull(); // holder data is not native and always delegated
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P1 fix #3: per-token curve state freshness. resolveCurve() (shared by getNativeMarketSnapshot AND
+// getNativeSellImpact) used to validate global stream coverage and per-token STATUS, but never how old the token's
+// own last curve-changing trade was relative to the current watermark -- so a token that simply stopped trading
+// while OTHER tokens kept the stream healthy could still expose its old curve state as VALID indefinitely. Reuses
+// the existing maxSnapshotSkewSec bound (now also governing this check; see pumpfunVolumeEngine.ts) -- the
+// PRODUCTION DEFAULT (5 s, unchanged) is exercised directly below, with no local override.
+// ---------------------------------------------------------------------------------------------------------------------
+describe('per-token curve freshness (P1 fix): a healthy global stream must never override one quiet token', () => {
+  it('fresh token state (well under the default 5 s bound) => VALID', () => {
+    const f = healthy(BASE_TS + 92);
+    const sim = launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }]);
+    const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 92)); // 2 s old: within the default bound
+    expect(s.quality).toBe('VALID');
+    expect(s.priceSol).toBeCloseTo(spotPriceSol(sim.vs, sim.vt)!, 18);
+  });
+
+  it('stale token state (well over the default 5 s bound) => TIMESTAMP_SKEW, not a fake GRADUATED and not silently VALID', () => {
+    const f = healthy(BASE_TS + 100);
+    launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }]); // M's last (and only) trade at +90
+    f.pace(BASE_TS + 101, BASE_TS + 250); // 150 s of an UNRELATED mint's trades: the global stream stays healthy
+    const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 250));
+    expect(s.quality).toBe('TIMESTAMP_SKEW');
+    expect(s.reason).toBe('timestamp_skew');
+    expect(s.priceSol).toBeNull();
+    expect(s.liquiditySol).toBeNull();
+    expect(s.priceImpactPct).toBeNull();
+  });
+
+  it('global stream healthy does not override token staleness: streamGate itself reports the stream as fine', () => {
+    const f = healthy(BASE_TS + 100);
+    launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }]);
+    f.pace(BASE_TS + 101, BASE_TS + 250);
+    const health = f.engine.health(at(BASE_TS + 250));
+    expect(health.started).toBe(true);
+    expect(health.connected).toBe(true);
+    expect(health.breakReason).toBeNull();
+    expect(health.watermarkLagSec).toBeLessThan(30); // the stream itself is not remotely stale
+    // ...and yet the per-token answer is still stale, because global health says nothing about THIS token:
+    expect(f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 250)).quality).toBe('TIMESTAMP_SKEW');
+  });
+
+  it('native sell impact is unavailable (not computed on a stale curve) when the token itself has gone quiet', () => {
+    const f = healthy(BASE_TS + 100);
+    launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }]);
+    f.pace(BASE_TS + 101, BASE_TS + 250);
+    const impact = f.engine.getNativeSellImpact(M, 1_000_000n, at(BASE_TS + 250));
+    expect(impact).toMatchObject({ quality: 'TIMESTAMP_SKEW', reason: 'timestamp_skew', sellPriceImpactPct: null });
+  });
+
+  it('native buy snapshot is unavailable when token state is stale (same check, same result, for the buy-side snapshot)', () => {
+    const f = healthy(BASE_TS + 100);
+    launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }]);
+    f.pace(BASE_TS + 101, BASE_TS + 250);
+    const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 250));
+    expect(s.buyTokenAmountRaw).toBeNull();
+    expect(s.volumeAccelerationX).toBeNull();
+  });
+
+  it('a new trade for the token refreshes state and restores VALID when all other checks pass', () => {
+    const f = healthy(BASE_TS + 100);
+    const sim = launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }]);
+    f.pace(BASE_TS + 101, BASE_TS + 250);
+    expect(f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 250)).quality).toBe('TIMESTAMP_SKEW');
+    f.curveTrade(M, sim.buy(500_000_000n), BASE_TS + 251); // any trade re-touches the curve AND advances the watermark
+    const s = f.engine.getNativeMarketSnapshot(M, ENTRY, at(BASE_TS + 251));
+    expect(s.quality).toBe('VALID');
+    expect(s.priceSol).toBeCloseTo(spotPriceSol(sim.vs, sim.vt)!, 18);
+  });
+
+  it('does not change the volume windows or their thresholds: a fresh token still reports the exact same 1m volume as before this fix', () => {
+    const f = healthy(BASE_TS + 100);
+    launch(f, M, BASE_TS + 50, [{ ts: BASE_TS + 90, buySol: 2 }, { ts: BASE_TS + 95, buySol: 1 }]);
+    const v = f.engine.getOneMinuteVolume(M, at(BASE_TS + 100));
+    expect(v.volume1mSol).toBeCloseTo(3, 8);
+    expect(v.coverage.status).toBe('COMPLETE');
   });
 });

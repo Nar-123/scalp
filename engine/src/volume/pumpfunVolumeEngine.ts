@@ -63,7 +63,13 @@ export interface PumpfunVolumeEngineOptions {
   maxBuckets?: number;
   maxMintStates?: number;
   mintStateIdleSec?: number;
-  /** Largest tolerated |price/liquidity as-of second - volume window end| (event seconds). Default 5. */
+  /**
+   * Largest tolerated skew, in event seconds, between (a) the volume-window end and the stream watermark, and (b)
+   * -- P1 fix -- the CURVE state's own last-updated second and the stream watermark (the per-token freshness bound:
+   * see `resolveCurve`'s use of this field). Default 5 (the existing, unchanged production value): a token whose
+   * own last curve-changing trade is more than 5 event-seconds behind the current watermark is treated as too
+   * stale to price a current decision on, however healthy the global stream otherwise is.
+   */
   maxSnapshotSkewSec?: number;
   onTradeAccepted?: (e: NormalizedTradeEvent) => void;
   onLifecycle?: (e: LifecycleEvent) => void;
@@ -489,6 +495,18 @@ export class PumpfunVolumeEngine implements OneMinuteVolumeProvider, NativeMarke
     if (track.post.mayhemMode === true) return { ok: false, quality: 'UNAVAILABLE', reason: 'unsupported_mayhem_curve' };
     if (track.post.mayhemMode === null) return { ok: false, quality: 'UNAVAILABLE', reason: 'curve_mode_unproven' };
     if (!track.stepOk) return { ok: false, quality: 'MALFORMED', reason: 'curve_step_inconsistent' };
+    // Per-TOKEN freshness. Every check above is either global (streamGate) or about this mint's STATUS -- none of
+    // them notice that the stream can be perfectly healthy overall (other mints keep the watermark advancing) while
+    // THIS token's own last curve-changing trade is much older than the current watermark, because it has simply
+    // gone quiet. Exposing that old curve state as VALID would be unsafe for a current decision. Reuses the
+    // existing data-quality bound (maxSnapshotSkewSec / PUMPFUN_NATIVE_MAX_SKEW_SEC) rather than inventing a new
+    // strategy threshold, and fails closed with the SAME quality/reason the file already uses for a timestamp gap
+    // (TIMESTAMP_SKEW / 'timestamp_skew') -- never a fake 'graduated', never silently treated as VALID. Computed
+    // from watermarkSec (event time), never nowMs: this file's own invariant is that wall-clock time is used only
+    // for liveness, never to decide what a window or a state answer contains.
+    const watermark = this.watermarkSec as number;
+    const curveAgeSec = watermark - track.eventSec;
+    if (curveAgeSec > this.o.maxSnapshotSkewSec) return { ok: false, quality: 'TIMESTAMP_SKEW', reason: 'timestamp_skew' };
     return { ok: true, track };
   }
 

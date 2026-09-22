@@ -117,6 +117,44 @@ export interface TradeEntryRecord {
   /** Phase 5.6 */
   entryTokenAmountRaw?: string | null;
   entryContext?: Record<string, unknown> | null;
+  /**
+   * P1 position-recovery fix: the SOL value actually deployed after entry fees/impact/slippage (the buy fill's
+   * `filledAmountSol`, same value `Position.entryFilledAmountSol` holds). Optional only so existing call sites/
+   * fixtures that predate this field keep compiling; the live orchestrator (orchestrator/loop.ts) always supplies
+   * it. A trade recorded without it can never be safely reconstructed after a restart -- see
+   * orchestrator/positionRecovery.ts, which treats a missing value here as "missing critical data", not a zero.
+   */
+  entryFilledAmountSol?: number | null;
+}
+
+/**
+ * Everything `positionRecovery.ts` needs to decide, for ONE ledger row with `status = 'open'`, whether it can be
+ * safely reconstructed into a live, monitored `Position` after a process restart -- or must instead be left open
+ * and flagged for manual reconciliation. See `TradeLedger.getRecoverableOpenPositions`.
+ */
+export interface RecoverableOpenTrade {
+  tradeId: string;
+  mint: string;
+  poolAddress: string | null;
+  entryTimeMs: number;
+  entryPriceSol: number;
+  entrySizeSol: number;
+  /** null => this trade predates the entry_filled_amount_sol column (or was recorded by a path that omitted it): recovery must not fabricate it. */
+  entryFilledAmountSol: number | null;
+  /** null/empty => the sell side can never be priced: recovery must not fabricate it. */
+  entryTokenAmountRaw: string | null;
+  entryFeesSol: number | null;
+  /** Used only to seed the recovered position's first price-history point; never treated as a live market read. */
+  entryLiquiditySol: number | null;
+  reentryIndex: number;
+  strategyVersion: string;
+  dryRun: boolean;
+  /**
+   * Non-null => this trade's on-chain reality may already differ from what the rest of the row says (see
+   * TradeLedger.markReconciliationNeeded). Recovery must treat this exactly like missing critical data: never
+   * reconstruct a live Position for it, regardless of how complete the other fields look.
+   */
+  reconciliationReason: string | null;
 }
 
 export interface TradeExitRecord {
