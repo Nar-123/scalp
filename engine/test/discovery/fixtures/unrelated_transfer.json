@@ -1,0 +1,42 @@
+{
+  "transaction": {
+    "message": {
+      "accountKeys": [
+        {
+          "pubkey": "93DUmQWvjATurLN549TQyZrJ5LddewpTVn32cdqCrs2a",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "pubkey": "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+          "signer": false,
+          "writable": true
+        },
+        {
+          "pubkey": "11111111111111111111111111111111",
+          "signer": false,
+          "writable": false
+        }
+      ],
+      "instructions": [
+        {
+          "programId": "11111111111111111111111111111111",
+          "program": "system",
+          "parsed": {
+            "info": {
+              "destination": "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+              "lamports": 5000,
+              "source": "93DUmQWvjATurLN549TQyZrJ5LddewpTVn32cdqCrs2a"
+            },
+            "type": "transfer"
+          }
+        }
+      ]
+    }
+  },
+  "meta": {
+    "preTokenBalances": [],
+    "postTokenBalances": [],
+    "innerInstructions": []
+  }
+}

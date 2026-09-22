@@ -1,0 +1,200 @@
+{
+ "note": "Real mainnet accounts fetched read-only during Phase 5.5 (public data). data = base64 account bytes. lastEvent = the last TradeEvent seen for that mint by the log stream (reserves as decimal strings).",
+ "global": {
+  "pda": "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+  "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "len": 1087,
+  "data": "p+joschscn8B07uMqzQc4FKEV/LDgX0yeEQZY9zVX+1YuiTJmd2sAqpKwvjQ3Vy8l+MonBl8tQYqVPPZVrnOblEV+WVnqlyz5gAQ2EfjzwMAAKwj/AYAAAAAeMX7UdECAACAxqR+jQMAXwAAAAAAAAAf6nQ58860xO9Lucx77kChpiYXG2hBX+3tQLeolW+E5wHB4eQAAAAAAAUAAAAAAAAAYIzMHfzpYbQ7d5wZFQWm4tO/RdWk20YYrXbILWF1RTVjg3MADqIssmTTSv9koEte+r+7dN3NBImXsZgVR9fREIOEdCkuZ1qUtDbssKmYiUIyioPdxiM4ApYSZ8XNYRfLjRgaDISfqTem80re0wge+VcAqssMm7PZCaS5FHUnpOutEeak/ClEpPqCUb74FUJuG/soxrZkZndgfGrZ9WamRteqj7Bg2CkbTE1HXa/3Yslr3A2s6zbAEurRLtOpSEFh4ATIfOuY+lzkf4A4Bv0seUXSlSSVmuwA3tl4FPOPeEYf6nQ58860xO9Lucx77kChpiYXG2hBX+3tQLeolW+E5wchXZlAeTaU4RYGbORZuBj9+bugx7QbeD+joSDKQZUyAaKLX9JqtHmmqcxsv2sLI+thiFo3HgEgrKkTvu89E4p46JMUH7GOnxV02BDheOGeMGBOMXWqLkoy38hgByfRBwkBNYRTYlYJT5EoGRJ++k5Ea0MzcheT0Th2+arb89x9C19udQGCIPlCZ3ADI3tNa0U3WbSlxpC1nDXZuxh6CQy9KjOYep67E2eZq1mSWxPl3Iswgd8AXbQnwUePpG/4w0egdOlUPz43otBGInrdy06cd0xEJYxD7fJKqKrh8AIUZlvaTDjNbbdDj1m0CLuew7TKnorR8fJGU8SZtXlsINv5sy3dnuo/ObNyEVxxhHwYRc+lNsaFB04DDkTQId4++eNcTLeA8I7i/uhL7ERqV3gl2mjUOfqKXaOwxc/1D2P0VGsBQ55lEMA9ZfrZMeidBL4Ltw1Rlx9RxBX7NEwH20GfISICI1UWqRcTTGdYjEk4IK4VXulmZVd6wbcY2kfdzyoFDuan4iBou4hkCqV/kJMIxh/vcRoBY/WnVcBwvIYNH2NnIHzs2lvMbLHq8PFtaEBFZrGNVtJIGssxcDJlbpBVHHhElkH4SVjcc6dqhdh1b1XALNrKiboZMnkMNoqxV+ktc8VLlrXJMZQeRupL4uDjESd0T8a3TPtFXv6vi9VxeSztRPwfePlKM9CQnF5rX7AhVwrY262N6P2z0g7RzZnrjk6HcBV+6+tnimVduZs39rEybHZX25DPuKh6vvjHtvLIaYgTAAAAAAAAALnS/wAAAADG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQEsAQAAAAAAAPbjY/aFP8BoR4dSDPaZvZ0/rDjsLVijekDffE1+UZWPAQ=="
+ },
+ "accounts": [
+  {
+   "kind": "standard",
+   "mint": "Ba1GDzRxj5iUAGS16zsLmF6bbUmbwvF5s6eot6rq4CEv",
+   "pda": "DqN7vFcyXDY6HH5KjN8RMiGJLHwLMzUhx21SbqyhuQJb",
+   "contextSlot": 448953959,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 13782142011,
+   "len": 151,
+   "data": "F7f4N2DYrGAyZwDqtZwCANPXiDEKAAAAMs/tnSSeAQDTK2U1AwAAAACAxqR+jQMAAMF13rAiYo4waGGeVTHygDWEgwBJRNIRmXVRx3y2wqJ9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953244,
+    "vsol": "51996158260",
+    "vtok": "619084204326804",
+    "rsol": "21996158260",
+    "rtok": "339184204326804",
+    "ts": 1789966506,
+    "sig": "4HZumic1v4DdnvqJDucMeRtQugrZVV222tH2ABJPSh1Tk6eta5twme3PpymX3qdtAuq1T2geuYje8A74ezgpWPLA"
+   }
+  },
+  {
+   "kind": "standard",
+   "mint": "244hMYe6AWfywH35XS2E14VRnS4obsxmbVYNoR4hs64J",
+   "pda": "CGvZWhW5p9gptXoTLkaVCBNkKAtob8Fi4CmrUMUm4jn7",
+   "contextSlot": 448953964,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 17074765607,
+   "len": 151,
+   "data": "F7f4N2DYrGC1RPbA720CAL9KyvUKAAAAtazjdF5vAQC/nqb5AwAAAACAxqR+jQMAAEIMZ11ML1Bv+1Eb727wNYny2pm3oNVnKvzg6udrjnEdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953246,
+    "vsol": "52191510487",
+    "vtok": "616766990556355",
+    "rsol": "22191510487",
+    "rtok": "336866990556355",
+    "ts": 1789966506,
+    "sig": "3Z8AVs573GU7NNSkiUWt411VDQE5zyc9kjSriGqBxNVBwi9JoCR7qKAEsvigjktQ2zyLcQyn1yiYU9BphNxVafYc"
+   }
+  },
+  {
+   "kind": "standard",
+   "mint": "4NsJNHyv7ieCTj1izCqnAU3mLYf9RM4pQz7QPLLepump",
+   "pda": "2UhW8aKoaVEhzkpaejPyBoBm8xNcdXHLHCVmtRR9kn5m",
+   "contextSlot": 448953968,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 419764880,
+   "len": 151,
+   "data": "F7f4N2DYrGDtbrBfd8IDACgmExUHAAAA7dadE+bDAgAoeu8YAAAAAACAxqR+jQMAAKa3wZTKSoIb4ALmkKNgiHoUkivffnukJhPQuHb42Ah8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953246,
+    "vsol": "51453111174",
+    "vtok": "625618146657960",
+    "rsol": "21453111174",
+    "rtok": "345718146657960",
+    "ts": 1789966506,
+    "sig": "2tGZbUwkAebjhkhwPSH7vaWazhs5kRzVwzJHQGAonFQxMH7XTXBg328FWFmD5QwoiGj1kfwQP2d8knauSKnGV2Zn"
+   }
+  },
+  {
+   "kind": "standard",
+   "mint": "DomacJjXCSEftKB6mPWSDa9Zxku8mVCcnJFkfPcfpump",
+   "pda": "BrNdugFua23uRvdYryFDY8uLBEspwRdXgzvqxDB3d4wG",
+   "contextSlot": 448953972,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 1723068675,
+   "len": 151,
+   "data": "F7f4N2DYrGB6l0077JoDAJv8wWIHAAAAev8671qcAgCbUJ5mAAAAAACAxqR+jQMAADexxHyPb95hk6+KyTEypJVrmvmbnUgzggAtKAUnz7SOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953237,
+    "vsol": "32266387753",
+    "vtok": "997632596764087",
+    "rsol": "2266387753",
+    "rtok": "717732596764087",
+    "ts": 1789966504,
+    "sig": "3a4kriZaLxKHc23pUFvKVQ5pZhPjqzA5KXnKdoVQp6wScpxsjo4xd4E7mXNpodSYvGevxqdyh9WtZG9giMuK63yk"
+   }
+  },
+  {
+   "kind": "mayhem",
+   "mint": "Fnz4dRCsJnG8hchjdkc2BQLEnbs3wT7KhsnVGCsppump",
+   "pda": "6CVZvbm4JiciN6o8MXd1ribeDTTzbHmGPtuKzKGvsiaf",
+   "contextSlot": 448953976,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 14861057,
+   "len": 151,
+   "data": "F7f4N2DYrGCkHBQdtd4DAB+HvigAAAAApIQB0SPgAgCZIs0AAAAAAACAxqR+jQMAALyHHcgoeswpdi24hxS6WvUzVxSAlKclbXq//0If81EYAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953087,
+    "vsol": "683575071",
+    "vtok": "1089294388436132",
+    "rsol": "13443737",
+    "rtok": "809394388436132",
+    "ts": 1789966464,
+    "sig": "2HbywkCLeCNzGogJzzT1Dr4xebVysqhj3SbCzDQxNNStoFRZcJDHU8f9bphNsCDcJAFsY9eT27LgE1WtPAbUCVn6"
+   }
+  },
+  {
+   "kind": "mayhem",
+   "mint": "CWAzEXm6BAEyGFJxvSX96BjMMyyEycSuz6VEt5oepump",
+   "pda": "D4yG43xajEZeW6DWLayQsiCQ6cR5agkH9nSsmrhwMBtJ",
+   "contextSlot": 448953981,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 11615700,
+   "len": 151,
+   "data": "F7f4N2DYrGDu7yQ2AusDAIQkMiYAAAAA7lcS6nDsAgBsnZsAAAAAAACAxqR+jQMAAAgWRvI2AtwPTvNAiTe2V0xP5QHcQ3HGmJivbq1n+liGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953246,
+    "vsol": "1591748837",
+    "vtok": "1099554622161624",
+    "rsol": "27565563",
+    "rtok": "819654622161624",
+    "ts": 1789966506,
+    "sig": "4DZdxHYG7XSWoi6xw262CAQ2Fq3mRA5uWWiDxzjMnCUtgTMZQpWCwTWhgZu6aohC7BgiJQ9jy5GEndCCcnZfidoB"
+   }
+  },
+  {
+   "kind": "mayhem",
+   "mint": "F7so7dZ7tJbeCUdJ1i45mS2L6vfFMQiNzDHvPESSpump",
+   "pda": "CfHhDiMYfAUkfV6QGcfcjTi4RWLJn15MhheT9y9urfqG",
+   "contextSlot": 448953985,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 9538623,
+   "len": 151,
+   "data": "F7f4N2DYrGAo5YPc7MoDABWQJU0AAAAAKE1xkFvMAgDX63sAAAAAAACAxqR+jQMAALZM150G9WH8LpuvVOEytE4XqRoH/BS2h+w83FclBK37AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448953075,
+    "vsol": "1294307349",
+    "vtok": "1067543590855976",
+    "rsol": "8121303",
+    "rtok": "787643590855976",
+    "ts": 1789966461,
+    "sig": "g6c3QsoejCyZ47xXrSso236cBkjVzEhymTZkTH9WL3bhYH1HX36JjLaRpqnDdTiuz8JrGneDR2mjH2mjXAZyXTB"
+   }
+  },
+  {
+   "kind": "graduated",
+   "mint": "Eij1GGCFrSUBaSU2Z4PqFtBwN6MEWYc6xpbi2fT2pump",
+   "pda": "9JPPJu6JjkFFtNKinKR3UVxC8WmQiyQh6sLuvuypVeE6",
+   "contextSlot": 448953989,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 1417320,
+   "len": 151,
+   "data": "F7f4N2DYrGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAxqR+jQMAAVj2BVkTt1aI1oKkWuekhXk+3QfbCcs4dbMRUuakHNr8AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 448952746,
+    "vsol": "167686129",
+    "vtok": "279900000000000",
+    "rsol": "136665404",
+    "rtok": "0",
+    "ts": 1789966374,
+    "sig": "2J1z9wTPAFf13Erbx98P2CrsBB8z8VenvhHXmaFyNEwMhZQQcYNiezz5xvVDZVnjvYRmWytZ4SUG8JxRMPt4aMa5"
+   }
+  },
+  {
+   "kind": "standard",
+   "mint": "6NoYX793tdAiHr1B2FPZMiZXmSNHrSccUJnwKLzNpump",
+   "pda": "DgrfqdJQg9TrPtwPouk5GPWkkdXdNSiVK1nmXw62sXrb",
+   "contextSlot": 448962020,
+   "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+   "lamports": 1285249,
+   "len": 125,
+   "data": "F7f4N2DYrGAAENhH488DAAmsI/wGAAAAAHjF+1HRAgAJAAAAAAAAAACAxqR+jQMAAB8vaHKO0lrljfMV1ar6W/Y71nVrQSCTCjAm2wG81rDTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "mintDecimals": 6,
+   "mintOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "lastEvent": {
+    "slot": 0,
+    "vsol": "0",
+    "vtok": "0",
+    "rsol": "0",
+    "rtok": "0",
+    "ts": 0,
+    "sig": ""
+   }
+  }
+ ]
+}

@@ -1,0 +1,94 @@
+{
+  "_meta": {
+    "source": "https://api.dexscreener.com/latest/dex/tokens/{mint} (public, unauthenticated)",
+    "captured_at_utc": "2026-09-20T15:58:04Z",
+    "note": "Real live token (IKUN, pump.fun origin, already rugged when captured). Kept verbatim except url/name/social fields dropped. liquidity.base is a TOKEN amount, liquidity.quote is SOL, volume.* is USD."
+  },
+  "pairs": [
+    {
+      "chainId": "solana",
+      "dexId": "pumpswap",
+      "pairAddress": "FZkKE6ymN3NxRLXV5Dm6fum7jZzVKZaLnSf8ENUdnQSD",
+      "baseToken": {
+        "address": "DC5XoBN2qE2DXzkLANSUzE2bBiFzVj9jDkcRXSuvpump",
+        "symbol": "IKUN"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.000000006247",
+      "priceUsd": "0.0000006777",
+      "txns": {
+        "m5": {
+          "buys": 375,
+          "sells": 3208
+        },
+        "h1": {
+          "buys": 4368,
+          "sells": 6425
+        },
+        "h6": {
+          "buys": 4368,
+          "sells": 6425
+        },
+        "h24": {
+          "buys": 4368,
+          "sells": 6425
+        }
+      },
+      "volume": {
+        "h24": 88185.71,
+        "h6": 88185.71,
+        "h1": 88185.71,
+        "m5": 17548.66
+      },
+      "liquidity": {
+        "usd": 705.2,
+        "base": 991688175,
+        "quote": 0.3054
+      },
+      "pairCreatedAt": 1789918786000
+    },
+    {
+      "chainId": "solana",
+      "dexId": "pumpfun",
+      "pairAddress": "AXu7uHPiQrq9oA8aJ79o2Jr5Domu6ecYRKYH4rmq5cEy",
+      "baseToken": {
+        "address": "DC5XoBN2qE2DXzkLANSUzE2bBiFzVj9jDkcRXSuvpump",
+        "symbol": "IKUN"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.0000004108",
+      "priceUsd": "0.00004442",
+      "txns": {
+        "m5": {
+          "buys": 0,
+          "sells": 0
+        },
+        "h1": {
+          "buys": 1,
+          "sells": 0
+        },
+        "h6": {
+          "buys": 1,
+          "sells": 0
+        },
+        "h24": {
+          "buys": 1,
+          "sells": 0
+        }
+      },
+      "volume": {
+        "h24": 9190.77,
+        "h6": 9190.77,
+        "h1": 9190.77,
+        "m5": 0
+      },
+      "pairCreatedAt": 1789918786000
+    }
+  ]
+}

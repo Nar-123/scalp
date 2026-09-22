@@ -1,0 +1,16 @@
+{
+  "name": "scalp",
+  "private": true,
+  "version": "0.1.0",
+  "description": "New-Token Ultra Scalper V1 - self-learning Solana meme-token scalping bot (monorepo root)",
+  "workspaces": [
+    "engine"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=engine",
+    "start": "npm run start --workspace=engine",
+    "dev": "npm run dev --workspace=engine",
+    "test": "npm run test --workspace=engine",
+    "lint": "npm run lint --workspace=engine"
+  }
+}

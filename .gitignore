@@ -1,0 +1,31 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+**/.env
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+engine/data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Wallet credentials / secret material -- never committed under any name.
+*.keypair.json
+*wallet*.json
+*.secret
+*.secrets
+secrets/
+credentials/
+*.dpapi
+*.cred
+
+# live shadow validation runs (ledgers, logs, scratch queries)
+data/live/

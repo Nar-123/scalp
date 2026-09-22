@@ -1,0 +1,99 @@
+{
+  "_meta": {
+    "source": "https://api.dexscreener.com/latest/dex/tokens/{mint} (public)",
+    "captured_at_utc": "2026-09-20T15:58:04Z",
+    "note": "Real JUP pairs: one USDC-quoted and one SOL-quoted pair. A USDC-side liquidity number must never be read as SOL."
+  },
+  "pairs": [
+    {
+      "chainId": "solana",
+      "dexId": "orca",
+      "pairAddress": "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP",
+      "baseToken": {
+        "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+        "symbol": "JUP"
+      },
+      "quoteToken": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC"
+      },
+      "priceNative": "0.2722",
+      "priceUsd": "0.2722",
+      "txns": {
+        "m5": {
+          "buys": 19,
+          "sells": 19
+        },
+        "h1": {
+          "buys": 386,
+          "sells": 346
+        },
+        "h6": {
+          "buys": 1637,
+          "sells": 1534
+        },
+        "h24": {
+          "buys": 7577,
+          "sells": 7548
+        }
+      },
+      "volume": {
+        "h24": 38824.27,
+        "h6": 6405.75,
+        "h1": 1669.3,
+        "m5": 86.9
+      },
+      "liquidity": {
+        "usd": 29390.88,
+        "base": 77844,
+        "quote": 8200.2053
+      },
+      "pairCreatedAt": 1706719531000
+    },
+    {
+      "chainId": "solana",
+      "dexId": "orca",
+      "pairAddress": "C1MgLojNLWBKADvu9BHdtgzz1oZX4dZ5zGdGcgvvW8Wz",
+      "baseToken": {
+        "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+        "symbol": "JUP"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.002502",
+      "priceUsd": "0.2717",
+      "txns": {
+        "m5": {
+          "buys": 17,
+          "sells": 13
+        },
+        "h1": {
+          "buys": 334,
+          "sells": 503
+        },
+        "h6": {
+          "buys": 1432,
+          "sells": 1995
+        },
+        "h24": {
+          "buys": 9556,
+          "sells": 11193
+        }
+      },
+      "volume": {
+        "h24": 1782035.29,
+        "h6": 294857.24,
+        "h1": 70803.9,
+        "m5": 4037.92
+      },
+      "liquidity": {
+        "usd": 541120.6,
+        "base": 1076959,
+        "quote": 2287.8663
+      },
+      "pairCreatedAt": 1706675725000
+    }
+  ]
+}
