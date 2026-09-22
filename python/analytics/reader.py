@@ -97,3 +97,25 @@ def get_token_evaluations(conn: sqlite3.Connection, strategy_version: str | None
     query += " ORDER BY evaluated_at_ms ASC"
     rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+# --- Phase 5: shadow ledger (read-only) --------------------------------------
+
+
+def get_shadow_closed_trades(conn: sqlite3.Connection, strategy_version: str) -> list[dict]:
+    """Closed SHADOW trades for one strategy version, chronological, as plain
+    dicts. Every row has execution_mode == 'shadow' -- these are simulated
+    fills, never real transactions, and never mixed with get_closed_trades()."""
+    rows = conn.execute(
+        "SELECT * FROM shadow_trades WHERE strategy_version = ? AND status = 'closed' ORDER BY entry_time_ms ASC",
+        (strategy_version,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_shadow_missed_signal_counts(conn: sqlite3.Connection, strategy_version: str) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT reason, COUNT(*) AS n FROM shadow_missed_signals WHERE strategy_version = ? GROUP BY reason",
+        (strategy_version,),
+    ).fetchall()
+    return {r["reason"]: r["n"] for r in rows}

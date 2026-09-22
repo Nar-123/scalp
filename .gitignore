@@ -26,3 +26,6 @@ secrets/
 credentials/
 *.dpapi
 *.cred
+
+# live shadow validation runs (ledgers, logs, scratch queries)
+data/live/

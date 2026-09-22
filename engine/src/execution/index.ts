@@ -4,6 +4,7 @@ export * from './liveExecutorStub.js';
 export * from './jupiterQuoteClient.js';
 export * from './marketPriceSource.js';
 export * from './transactionSafety.js';
+export * from './fillSimulation.js';
 export * from './signer/nullSigner.js';
 export * from './signer/keypairSigner.js';
 export * from './signer/windowsDpapiSecretProvider.js';

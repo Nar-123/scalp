@@ -13,7 +13,7 @@ export const ConfigSchema = z.object({
     .object({
       birdeyeApiKey: z.string().optional(),
       dexscreenerBaseUrl: z.string().url().default('https://api.dexscreener.com'),
-      jupiterQuoteBaseUrl: z.string().url().default('https://quote-api.jup.ag/v6'),
+      jupiterQuoteBaseUrl: z.string().url().default('https://lite-api.jup.ag/swap/v1'),
       requestTimeoutMs: z.number().int().positive().default(4000),
     })
     .default({}),
@@ -101,6 +101,9 @@ export const ConfigSchema = z.object({
     .object({
       maxTop10HolderPct: z.number().positive().default(60),
       excludeAddresses: z.array(z.string()).default([]),
+      // Phase 5.6E safeguards for the verified-vault holder policy. 0 = OFF: no new policy threshold is set by default.
+      minCirculatingSharePct: z.number().min(0).max(100).default(0),
+      minVisibleHolders: z.number().int().nonnegative().default(0),
     })
     .default({}),
 
@@ -114,6 +117,80 @@ export const ConfigSchema = z.object({
       // else; must be an explicit, deliberate operator choice.
       liveTradingExplicitlyEnabled: z.boolean().default(false),
       walletCredentialPath: z.string().optional(),
+    })
+    .default({}),
+
+  shadow: z
+    .object({
+      // Read-only realtime shadow trading (Phase 5/5.1). Default OFF: with it off
+      // no ShadowRunner exists and behavior is identical to before the flag.
+      // Enabling it never enables signing, sending, or live execution.
+      enabled: z.boolean().default(false),
+    })
+    .default({}),
+
+  volume: z
+    .object({
+      // Phase 5.4B: native Pump.fun 1-minute SOL volume from the shared trade-event stream.
+      // Read-only chain data; nothing here signs or sends. Off => volume1mSol stays null (unavailable).
+      pumpfunNativeEnabled: z.boolean().default(true),
+      recordTradeEvents: z.boolean().default(true),
+      tradeEventRetentionHours: z.number().positive().default(24),
+      streamSilenceMs: z.number().int().positive().default(5000),
+      // Phase 5.5: native bonding-curve market data (price, liquidity, exact price impact) as the PRIMARY source for
+      // Pump.fun tokens. Off => the Phase 5.4B behavior (DexScreener market data, native volume only).
+      nativeMarketEnabled: z.boolean().default(true),
+      // Largest tolerated gap between the price/liquidity as-of second and the volume window end (event seconds).
+      nativeMaxSnapshotSkewSec: z.number().int().positive().default(5),
+      // Default false: a Pump.fun curve token whose native state is unprovable is market_data_unavailable, not silently priced by DexScreener.
+      dexscreenerFallbackForCurveTokens: z.boolean().default(false),
+    })
+    .default({}),
+
+  // Phase 5.6A: provider request discipline. Endpoints themselves stay in `rpc.*` and `aggregators.*` (env
+  // SOLANA_RPC_URL / SOLANA_RPC_WS_URL / JUPITER_BASE_URL, with the older RPC_HTTP_URL / RPC_WS_URL /
+  // JUPITER_QUOTE_BASE_URL still honored). Credentials come only from the environment and are never logged.
+  providers: z
+    .object({
+      rpc: z
+        .object({
+          apiKey: z.string().optional(),
+          fallbackUrls: z.array(z.string().url()).default([]),
+          timeoutMs: z.number().int().positive().default(4000),
+          maxConcurrent: z.number().int().positive().default(4),
+          maxRequestsPerSecond: z.number().positive().default(8),
+          maxRetries: z.number().int().nonnegative().default(2),
+          baseBackoffMs: z.number().int().positive().default(250),
+          maxBackoffMs: z.number().int().positive().default(2000),
+          maxTotalMs: z.number().int().positive().default(8000),
+          circuitFailureThreshold: z.number().int().positive().default(5),
+          circuitCooldownMs: z.number().int().positive().default(15_000),
+          unsupportedCooldownMs: z.number().int().positive().default(600_000),
+          // Mint / holder data may be reused this long at most (hard cap 10 s = the decision staleness bound).
+          safetyDataTtlMs: z.number().int().nonnegative().max(10_000).default(10_000),
+        })
+        .default({}),
+      quote: z
+        .object({
+          apiKey: z.string().optional(),
+          fallbackUrls: z.array(z.string().url()).default([]),
+          timeoutMs: z.number().int().positive().default(4000),
+          maxConcurrent: z.number().int().positive().default(4),
+          maxRequestsPerSecond: z.number().positive().default(4),
+          maxRetries: z.number().int().nonnegative().default(2),
+          baseBackoffMs: z.number().int().positive().default(300),
+          maxBackoffMs: z.number().int().positive().default(2500),
+          maxTotalMs: z.number().int().positive().default(8000),
+          circuitFailureThreshold: z.number().int().positive().default(5),
+          circuitCooldownMs: z.number().int().positive().default(15_000),
+          unsupportedCooldownMs: z.number().int().positive().default(600_000),
+          // An identical quote may be reused this long at most (hard cap 10 s).
+          cacheTtlMs: z.number().int().nonnegative().max(10_000).default(2000),
+        })
+        .default({}),
+      metricsLogIntervalMs: z.number().int().nonnegative().default(60_000),
+      /** Upper bound for each step of the shutdown sequence. */
+      shutdownStepTimeoutMs: z.number().int().positive().default(4000),
     })
     .default({}),
 

@@ -47,3 +47,49 @@ export function ownLogsMatchAnyMarker(logs: string[], programId: string, markers
   const ownLines = getOwnLogLines(logs, programId);
   return ownLines.some((line) => markers.some((marker) => line.includes(marker)));
 }
+
+const PROGRAM_DATA_PREFIX = 'Program data: ';
+
+export interface OwnProgramDataPayload {
+  /** Position among ALL `Program data:` lines emitted by this program in the transaction (0-based). */
+  index: number;
+  /** Raw base64 payload of the log line (the Anchor event: 8-byte discriminator + borsh body). */
+  base64: string;
+}
+
+/**
+ * `Program data: <base64>` lines emitted BY `programId` itself (Anchor
+ * `emit!` events written with sol_log_data). Same invoke-stack attribution as
+ * `getOwnLogLines`: a wrapper/aggregator that logs its own `Program data:`
+ * line, or a program this one CPIs into, is never attributed to `programId`
+ * (verified live in Phase 5.4A -- wrappers do log their own data lines).
+ */
+export function getOwnProgramDataPayloads(logs: string[], programId: string): OwnProgramDataPayload[] {
+  const invokeRe = /^Program (\S+) invoke \[(\d+)\]$/;
+  const endRe = /^Program (\S+) (success|failed.*)$/;
+  const stack: string[] = [];
+  const payloads: OwnProgramDataPayload[] = [];
+  let index = 0;
+
+  for (const line of logs) {
+    const invokeMatch = invokeRe.exec(line);
+    if (invokeMatch) {
+      stack.push(invokeMatch[1] as string);
+      continue;
+    }
+    const endMatch = endRe.exec(line);
+    if (endMatch && stack.length > 0 && stack[stack.length - 1] === endMatch[1]) {
+      stack.pop();
+      continue;
+    }
+    if (line.startsWith(PROGRAM_DATA_PREFIX) && stack[stack.length - 1] === programId) {
+      payloads.push({ index: index++, base64: line.slice(PROGRAM_DATA_PREFIX.length) });
+    }
+  }
+  return payloads;
+}
+
+/** The runtime writes this marker when a transaction's log output exceeded its size limit; later lines are missing. */
+export function logsWereTruncated(logs: string[]): boolean {
+  return logs.some((line) => line === 'Log truncated' || line.startsWith('Log truncated'));
+}

@@ -8,6 +8,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "backtest": "node dist/backtest/cli.js",
+    "shadow-status": "node dist/shadow/cli.js",
     "dev": "tsx watch src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",

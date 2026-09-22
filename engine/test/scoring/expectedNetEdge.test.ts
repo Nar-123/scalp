@@ -9,6 +9,7 @@ const baseInputs = {
   priorityFeeSol: 0.0005,
   slippagePct: 0.3,
   priceImpactPct: 0.5,
+  sellPriceImpactPct: 0.5, // Phase 5.6H: the edge is a complete round trip and needs the SELL impact too
   safetyMarginBps: 50,
   positionSizeSol: 0.3,
 };

@@ -55,6 +55,24 @@ def test_split_rejects_invalid_fractions():
         split_train_validation_oos(trades, train_frac=0.7, validation_frac=0.5)  # sums > 1
 
 
+def test_split_records_a_period_for_every_bucket():
+    trades = make_trades(100)
+    split = split_train_validation_oos(trades, train_frac=0.6, validation_frac=0.2)
+    assert split.training_period.start_ms == 0
+    assert split.training_period.end_ms == 59_000
+    assert split.validation_period.start_ms == 60_000
+    assert split.validation_period.end_ms == 79_000
+    assert split.oos_period.start_ms == 80_000
+    assert split.oos_period.end_ms == 99_000
+
+
+def test_split_records_none_period_for_an_empty_bucket():
+    trades = make_trades(2)
+    split = split_train_validation_oos(trades, train_frac=0.9, validation_frac=0.05)
+    assert split.validation == []
+    assert split.validation_period is None
+
+
 def test_assert_no_temporal_leakage_passes_for_valid_split():
     trades = make_trades(90)
     split = split_train_validation_oos(trades)

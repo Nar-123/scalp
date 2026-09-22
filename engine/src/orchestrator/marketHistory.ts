@@ -39,11 +39,18 @@ export class MarketHistoryTracker {
     return pctChange(reference.priceSol, currentPriceSol);
   }
 
-  computeVolumeAccelerationX(mint: string, currentVolume1mSol: number, nowMs: number): number {
+  /**
+   * current 1-minute SOL volume / the 1-minute SOL volume ~60s earlier. Both
+   * operands are the SAME quantity in the SAME unit (volume1mSol); if either
+   * is unavailable (null) the ratio is unavailable (null) -- never computed
+   * across mixed units or windows.
+   */
+  computeVolumeAccelerationX(mint: string, currentVolume1mSol: number | null, nowMs: number): number | null {
+    if (currentVolume1mSol === null) return null;
     const reference = findClosestBefore(this.history.get(mint) ?? [], nowMs - ACCELERATION_WINDOW_MS);
-    if (!reference || reference.volume1mSol <= 0) {
-      return currentVolume1mSol > 0 ? Number.POSITIVE_INFINITY : 0;
-    }
+    if (!reference) return currentVolume1mSol > 0 ? Number.POSITIVE_INFINITY : 0;
+    if (reference.volume1mSol === null) return null;
+    if (reference.volume1mSol <= 0) return currentVolume1mSol > 0 ? Number.POSITIVE_INFINITY : 0;
     return currentVolume1mSol / reference.volume1mSol;
   }
 

@@ -38,10 +38,29 @@ class TemporalLeakageError(ValueError):
 
 
 @dataclass(frozen=True)
+class PeriodBounds:
+    start_ms: int
+    end_ms: int
+
+
+def _period_of(items: list[dict]) -> PeriodBounds | None:
+    if not items:
+        return None
+    times = [i["entry_time_ms"] for i in items]
+    return PeriodBounds(start_ms=min(times), end_ms=max(times))
+
+
+@dataclass(frozen=True)
 class TemporalSplit:
     train: list[dict]
     validation: list[dict]
     out_of_sample: list[dict]
+    # Stored explicitly (task I: "store training_period/validation_period/
+    # oos_period with every validation result") rather than left for a
+    # caller to recompute from train/validation/out_of_sample every time.
+    training_period: PeriodBounds | None = None
+    validation_period: PeriodBounds | None = None
+    oos_period: PeriodBounds | None = None
 
 
 def split_train_validation_oos(
@@ -63,10 +82,17 @@ def split_train_validation_oos(
     train_end = int(n * train_frac)
     validation_end = train_end + int(n * validation_frac)
 
+    train = trades_in_chronological_order[:train_end]
+    validation = trades_in_chronological_order[train_end:validation_end]
+    out_of_sample = trades_in_chronological_order[validation_end:]
+
     split = TemporalSplit(
-        train=trades_in_chronological_order[:train_end],
-        validation=trades_in_chronological_order[train_end:validation_end],
-        out_of_sample=trades_in_chronological_order[validation_end:],
+        train=train,
+        validation=validation,
+        out_of_sample=out_of_sample,
+        training_period=_period_of(train),
+        validation_period=_period_of(validation),
+        oos_period=_period_of(out_of_sample),
     )
     assert_no_temporal_leakage(split)
     return split

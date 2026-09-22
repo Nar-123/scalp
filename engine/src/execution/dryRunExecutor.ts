@@ -1,14 +1,16 @@
 import type { AppConfig } from '../config/schema.js';
 import type { Logger } from '../logging/logger.js';
 import { isFiniteNumber } from '../utils/math.js';
+import { simulateBuyFill, simulateSellFill } from './fillSimulation.js';
 import type { BuyParams, ExecutionEngine, FillResult, PriceSource, SellParams } from './types.js';
 
 /**
  * Simulates fills using live market data -- no transaction is ever built or
  * sent, no wallet or Signer is touched. Applies real quoted price impact
  * plus a configurable latency-slippage buffer and the configured fee
- * schedule, so simulated PnL is a realistic (if imperfect) approximation of
- * what a live fill would look like.
+ * schedule (via the shared `simulateFill` -- see fillSimulation.ts), so
+ * simulated PnL is a realistic (if imperfect) approximation of what a live
+ * fill would look like.
  */
 export class DryRunExecutor implements ExecutionEngine {
   constructor(
@@ -16,11 +18,6 @@ export class DryRunExecutor implements ExecutionEngine {
     private readonly cfg: Pick<AppConfig, 'edge' | 'execution'>,
     private readonly logger?: Logger,
   ) {}
-
-  private computeFees(grossSol: number): number {
-    const bpsFees = (grossSol * (this.cfg.edge.dexFeeBps + this.cfg.edge.swapFeeBps)) / 10_000;
-    return this.cfg.edge.networkFeeSol + this.cfg.edge.priorityFeeSol + bpsFees;
-  }
 
   private failedFill(error: string): FillResult {
     return {
@@ -44,15 +41,16 @@ export class DryRunExecutor implements ExecutionEngine {
       return this.failedFill('price_unavailable');
     }
 
-    const priceImpactPct =
-      (await this.priceSource.getEstimatedPriceImpactPct(params.mint, params.amountSol)) ??
-      this.cfg.execution.fallbackPriceImpactPct;
+    // FAIL CLOSED: an entry whose buy impact cannot be quoted is not simulated with a default.
+    const quote = await this.priceSource.getBuyExecutionQuote(params.mint, params.amountSol);
+    if (!quote || !isFiniteNumber(quote.priceImpactPct) || quote.priceImpactPct < 0) {
+      this.logger?.warn({ mint: params.mint }, 'dry-run buy: price impact unavailable');
+      return { ...this.failedFill('buy_price_impact_unavailable'), retryable: true };
+    }
+    const priceImpactPct = quote.priceImpactPct;
     const latencySlippagePct = this.cfg.execution.latencySlippageBufferPct;
-    const feesSol = this.computeFees(params.amountSol);
-
-    const effectiveAmountSol =
-      params.amountSol - feesSol - (params.amountSol * (priceImpactPct + latencySlippagePct)) / 100;
-    const filledAmountSol = Math.max(effectiveAmountSol, 0);
+    // BUY: the venue fee is charged on top of the spend, at the fee rate the token's quote was computed with (else the generic model).
+    const { feesSol, filledAmountSol, breakdown } = simulateBuyFill(params.amountSol, priceImpactPct, latencySlippagePct, this.cfg.edge, quote.venueFeeBps ?? null);
 
     return {
       success: true,
@@ -64,6 +62,9 @@ export class DryRunExecutor implements ExecutionEngine {
       timestampMs: Date.now(),
       slippagePct: latencySlippagePct,
       priceImpactPct,
+      tokenAmountRaw: quote.tokenAmountRaw,
+      venueFeeBps: breakdown.feeBps,
+      feeModel: breakdown.feeModel,
     };
   }
 
@@ -71,18 +72,24 @@ export class DryRunExecutor implements ExecutionEngine {
     const currentPriceSol = await this.priceSource.getPrice(params.mint);
     if (!isFiniteNumber(currentPriceSol) || currentPriceSol <= 0 || params.entryPriceSol <= 0) {
       this.logger?.warn({ mint: params.mint }, 'dry-run sell: price unavailable');
-      return this.failedFill('price_unavailable');
+      return { ...this.failedFill('price_unavailable'), retryable: true };
+    }
+    // The SELL is priced in the SELL direction for the tokens actually held. No token amount => no sell impact => fail closed.
+    if (!params.tokenAmountRaw) {
+      this.logger?.warn({ mint: params.mint }, 'dry-run sell: position token amount unknown');
+      return this.failedFill('sell_token_amount_unknown');
+    }
+    const sellImpactPct = await this.priceSource.getSellPriceImpactPct(params.mint, params.tokenAmountRaw);
+    if (!isFiniteNumber(sellImpactPct) || sellImpactPct < 0) {
+      this.logger?.warn({ mint: params.mint }, 'dry-run sell: sell price impact unavailable');
+      return { ...this.failedFill('sell_price_impact_unavailable'), retryable: true };
     }
 
     const grossValueSol = params.entryFilledAmountSol * (currentPriceSol / params.entryPriceSol);
-    const priceImpactPct =
-      (await this.priceSource.getEstimatedPriceImpactPct(params.mint, grossValueSol)) ??
-      this.cfg.execution.fallbackPriceImpactPct;
     const latencySlippagePct = this.cfg.execution.latencySlippageBufferPct;
-    const feesSol = this.computeFees(grossValueSol);
-
-    const netValueSol = grossValueSol - feesSol - (grossValueSol * (priceImpactPct + latencySlippagePct)) / 100;
-    const filledAmountSol = Math.max(netValueSol, 0);
+    // SELL: the venue fee is deducted from the proceeds, at the token's current fee rate (else the generic model).
+    const venueFeeBps = (await this.priceSource.getVenueFeeBps?.(params.mint)) ?? null;
+    const { feesSol, filledAmountSol, breakdown } = simulateSellFill(grossValueSol, sellImpactPct, latencySlippagePct, this.cfg.edge, venueFeeBps);
 
     return {
       success: true,
@@ -93,7 +100,9 @@ export class DryRunExecutor implements ExecutionEngine {
       simulated: true,
       timestampMs: Date.now(),
       slippagePct: latencySlippagePct,
-      priceImpactPct,
+      priceImpactPct: sellImpactPct,
+      venueFeeBps: breakdown.feeBps,
+      feeModel: breakdown.feeModel,
     };
   }
 }

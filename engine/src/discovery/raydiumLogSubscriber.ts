@@ -1,4 +1,5 @@
 import { Connection, PublicKey, type Logs } from '@solana/web3.js';
+import { runBounded } from '../lifecycle/shutdown.js';
 import type { DiscoveredTokenEvent } from '../types/token.js';
 import type { TokenDiscoverySource } from './types.js';
 import type { Logger } from '../logging/logger.js';
@@ -7,6 +8,8 @@ import { detectRaydiumAmmV4PoolCreation, RAYDIUM_AMM_V4_PROGRAM_ID } from './cre
 export interface RaydiumLogSubscriberOptions {
   programId: string;
   commitment?: 'confirmed' | 'finalized';
+  /** Upper bound on the RPC unsubscribe during stop() (default 3000 ms). */
+  stopTimeoutMs?: number;
   /**
    * Raydium AMM V4 is a native, non-Anchor program: live sampling during
    * Phase 1.1 showed it logs almost nothing distinctive per-instruction
@@ -35,6 +38,7 @@ const DEFAULT_MAX_FETCHES_PER_SECOND = 1;
 export class RaydiumLogSubscriber implements TokenDiscoverySource {
   readonly name = 'raydium';
   private subscriptionId: number | null = null;
+  private stopped = false;
   private readonly programPubkey: PublicKey;
   private readonly maxFetchesPerSecond: number;
   private fetchesThisWindow = 0;
@@ -67,10 +71,17 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
     this.logger?.info({ source: this.name, subscriptionId: this.subscriptionId }, 'discovery source started');
   }
 
+  /**
+   * Bounded: the RPC unsubscribe is best-effort. On a rate-limited or stalled websocket it can hang indefinitely
+   * (measured in Phase 5.6), so it is raced against a timeout and never blocks shutdown. After stop() no new log is
+   * processed, so no provider request is started once shutdown has begun.
+   */
   async stop(): Promise<void> {
-    if (this.subscriptionId !== null) {
-      await this.connection.removeOnLogsListener(this.subscriptionId);
-      this.subscriptionId = null;
+    this.stopped = true;
+    const id = this.subscriptionId;
+    this.subscriptionId = null;
+    if (id !== null) {
+      await runBounded(() => this.connection.removeOnLogsListener(id), this.options.stopTimeoutMs ?? 3000);
     }
   }
 
@@ -86,6 +97,7 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
   }
 
   private async handleLogs(logs: Logs, onEvent: (event: DiscoveredTokenEvent) => void): Promise<void> {
+    if (this.stopped) return;
     try {
       if (logs.err) return;
       if (!this.allowFetch()) return;
@@ -111,6 +123,7 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
         createdAtSlot: tx.slot,
         createdAtMs,
         initialLiquiditySol: null,
+        detectedAtMs: Date.now(),
       });
     } catch (err) {
       this.logger?.warn({ err: String(err), signature: logs.signature }, 'failed handling raydium log event');

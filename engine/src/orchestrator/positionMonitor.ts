@@ -11,8 +11,15 @@ import type { Position, PricePoint } from '../types/trade.js';
 import { pctChange } from '../utils/math.js';
 import { utcDateString } from '../utils/time.js';
 import { computeRecentMomentumPct, computeRecentVolatilityPct } from './positionSignals.js';
+import { buildExitContext } from './decisionContext.js';
 
 const POLL_INTERVAL_MS = 1000;
+/**
+ * A sell that could not even be PRICED (price / token amount / sell impact unavailable) executed nothing, so the
+ * position is intact and the sell is retried on the next poll. If it stays unpriceable this long the existing
+ * fail-closed path takes over (execution_safety_failure + emergency stop). Data-quality bound, not a strategy parameter.
+ */
+const MAX_SELL_DEFERRAL_MS = 60_000;
 
 export interface PositionMonitorDeps {
   executor: ExecutionEngine;
@@ -30,6 +37,10 @@ export interface PositionMonitorDeps {
  */
 export class PositionMonitor {
   private readonly positions = new Map<string, Position>();
+  private readonly closing = new Set<string>();
+  private readonly deferredSince = new Map<string, number>();
+  /** Retryable sell attempts that did not execute because an input was unavailable (observability). */
+  sellDeferrals = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -66,6 +77,7 @@ export class PositionMonitor {
   }
 
   private async pollOne(position: Position): Promise<void> {
+    if (this.closing.has(position.tradeId)) return; // a sell for this position is already in flight
     try {
       const nowMs = Date.now();
       const [currentPriceSol, liquidityVolume] = await Promise.all([
@@ -112,14 +124,31 @@ export class PositionMonitor {
   }
 
   private async closePosition(position: Position, reason: NonNullable<ReturnType<typeof evaluateExit>['reason']>): Promise<void> {
-    this.positions.delete(position.tradeId);
+    this.closing.add(position.tradeId);
+    let fill;
+    try {
+      fill = await this.deps.executor.sell({
+        mint: position.mint,
+        entryPriceSol: position.entryPriceSol,
+        entryFilledAmountSol: position.entryFilledAmountSol,
+        tokenAmountRaw: position.entryTokenAmountRaw ?? null,
+        maxSlippageBps: this.hard.maxSlippageBps,
+      });
+    } finally {
+      this.closing.delete(position.tradeId);
+    }
 
-    const fill = await this.deps.executor.sell({
-      mint: position.mint,
-      entryPriceSol: position.entryPriceSol,
-      entryFilledAmountSol: position.entryFilledAmountSol,
-      maxSlippageBps: this.hard.maxSlippageBps,
-    });
+    if (!fill.success && fill.retryable) {
+      const since = this.deferredSince.get(position.tradeId) ?? fill.timestampMs;
+      this.deferredSince.set(position.tradeId, since);
+      if (fill.timestampMs - since < MAX_SELL_DEFERRAL_MS) {
+        this.sellDeferrals += 1;
+        this.deps.logger.warn({ mint: position.mint, tradeId: position.tradeId, error: fill.error }, 'sell deferred: not executed, an input was unavailable; will retry');
+        return; // position stays open
+      }
+    }
+    this.deferredSince.delete(position.tradeId);
+    this.positions.delete(position.tradeId);
 
     const nowMs = fill.timestampMs;
     const pnlSol = fill.filledAmountSol - position.entrySizeSol;
@@ -145,6 +174,20 @@ export class PositionMonitor {
       maxFavorableExcursionPct: mfePct,
       maxAdverseExcursionPct: maePct,
       dailyRealizedPnlSolAtExit: updatedRealizedPnl,
+      exitContext: buildExitContext({
+        exitReason: fill.success ? reason : 'execution_safety_failure',
+        exitObservedAtMs: nowMs,
+        entryPriceSol: position.entryPriceSol,
+        exitPriceSol: fill.filledPriceSol,
+        entrySizeSol: position.entrySizeSol,
+        entryFilledAmountSol: position.entryFilledAmountSol,
+        exitFilledAmountSol: fill.filledAmountSol,
+        entryFeesSol: position.entryFeesSol ?? null,
+        exitFeesSol: fill.feesSol,
+        sellPriceImpactPct: fill.success ? fill.priceImpactPct : null,
+        exitSlippagePct: fill.slippagePct,
+        holdDurationMs: nowMs - position.entryTimeMs,
+      }),
     });
 
     if (isDailyLossLimitBreached(updatedRealizedPnl, dailyState.startingBalanceSol, this.hard.dailyLossLimitPct)) {

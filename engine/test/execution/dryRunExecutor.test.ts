@@ -11,6 +11,8 @@ function priceSource(overrides: Partial<PriceSource> = {}): PriceSource {
   return {
     getPrice: vi.fn().mockResolvedValue(1),
     getEstimatedPriceImpactPct: vi.fn().mockResolvedValue(0.5),
+    getBuyExecutionQuote: vi.fn().mockResolvedValue({ priceImpactPct: 0.5, tokenAmountRaw: '1000000' }),
+    getSellPriceImpactPct: vi.fn().mockResolvedValue(0.5),
     ...overrides,
   };
 }
@@ -41,18 +43,17 @@ describe('DryRunExecutor', () => {
     expect(fill.filledAmountSol).toBe(0);
   });
 
-  it('falls back to the configured fallback price impact when none is available', async () => {
-    const executor = new DryRunExecutor(
-      priceSource({ getEstimatedPriceImpactPct: vi.fn().mockResolvedValue(null) }),
-      cfg,
-    );
+  it('FAILS CLOSED (Phase 5.6) when the buy price impact is unavailable: no fallback default is invented', async () => {
+    const executor = new DryRunExecutor(priceSource({ getBuyExecutionQuote: vi.fn().mockResolvedValue(null) }), cfg);
     const fill = await executor.buy({ mint: 'MINT', amountSol: 0.3, maxSlippageBps: 100 });
-    expect(fill.priceImpactPct).toBe(cfg.execution.fallbackPriceImpactPct);
+    expect(fill.success).toBe(false);
+    expect(fill.error).toBe('buy_price_impact_unavailable');
+    expect(fill.filledAmountSol).toBe(0);
   });
 
   it('sell computes value from the price ratio since entry, not raw token amounts', async () => {
     const executor = new DryRunExecutor(priceSource({ getPrice: vi.fn().mockResolvedValue(2) }), cfg); // price doubled
-    const fill = await executor.sell({ mint: 'MINT', entryPriceSol: 1, entryFilledAmountSol: 0.29, maxSlippageBps: 100 });
+    const fill = await executor.sell({ mint: 'MINT', entryPriceSol: 1, entryFilledAmountSol: 0.29, tokenAmountRaw: '1000000', maxSlippageBps: 100 });
 
     expect(fill.success).toBe(true);
     const grossValueSol = 0.29 * (2 / 1);

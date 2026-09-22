@@ -12,6 +12,8 @@ const VALID_MINT = 'So11111111111111111111111111111111111111112';
 
 function makeConnection(largestAccounts: { address: string; amount: string }[] = []): Connection {
   return {
+    // Phase 5.6E: no Pump.fun bonding curve exists for this mint (both accounts missing) => the previous holder metric applies unchanged
+    getMultipleAccountsInfo: vi.fn().mockResolvedValue([null, null]),
     getTokenLargestAccounts: vi.fn().mockResolvedValue({
       value: largestAccounts.map((a) => ({ address: { toBase58: () => a.address }, amount: a.amount })),
     }),

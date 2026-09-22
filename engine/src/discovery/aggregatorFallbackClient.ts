@@ -3,15 +3,8 @@ import type { AppConfig } from '../config/schema.js';
 import type { AggregatorHolderConcentration, AggregatorLiquidityVolume } from '../types/market.js';
 import type { AggregatorClient } from './types.js';
 import { isFiniteNumber } from '../utils/math.js';
+import { type DexscreenerPair, interpretPair, pickTokenSolPair } from './dexscreenerUnits.js';
 import type { Logger } from '../logging/logger.js';
-
-interface DexscreenerPair {
-  liquidity?: { base?: number; quote?: number; usd?: number };
-  volume?: { m5?: number; h1?: number };
-  txns?: { m5?: { buys?: number; sells?: number }; h1?: { buys?: number; sells?: number } };
-  priceNative?: string;
-  quoteToken?: { symbol?: string };
-}
 
 interface DexscreenerResponse {
   pairs?: DexscreenerPair[] | null;
@@ -51,44 +44,29 @@ export class DexscreenerBirdeyeAggregator implements AggregatorClient {
     }
   }
 
-  private pickBestPair(pairs: DexscreenerPair[] | null | undefined): DexscreenerPair | null {
-    if (!Array.isArray(pairs) || pairs.length === 0) return null;
-    let best: DexscreenerPair | null = null;
-    let bestLiquidity = -Infinity;
-    for (const pair of pairs) {
-      const liquidity = pair.liquidity?.usd ?? -Infinity;
-      if (isFiniteNumber(liquidity) && liquidity > bestLiquidity) {
-        bestLiquidity = liquidity;
-        best = pair;
-      }
-    }
-    return best ?? pairs[0] ?? null;
-  }
-
+  /**
+   * Returns SOL-denominated liquidity, 5-minute-converted volume, and buy/sell
+   * counts for the best TOKEN/SOL pair -- see dexscreenerUnits.ts for the unit
+   * contract. Returns null (fail closed) when no pair is provably TOKEN/SOL or
+   * its SOL-side liquidity is unavailable. `volume1mSol` is always null: no
+   * real 1-minute volume source exists here.
+   */
   async getLiquidityAndVolume(mint: string): Promise<AggregatorLiquidityVolume | null> {
     const data = await this.fetchJson<DexscreenerResponse>(
       `${this.cfg.dexscreenerBaseUrl}/latest/dex/tokens/${encodeURIComponent(mint)}`,
     );
-    const pair = this.pickBestPair(data?.pairs);
+    const pair = pickTokenSolPair(data?.pairs, mint);
     if (!pair) return null;
-
-    const liquiditySol = pair.liquidity?.base;
-    const volume1mRaw = pair.volume?.m5 !== undefined ? pair.volume.m5 / 5 : undefined;
-    const usingM5Txns = pair.txns?.m5 !== undefined;
-    const txns = pair.txns?.m5 ?? pair.txns?.h1;
-    const buys = txns?.buys ?? 0;
-    const sells = txns?.sells ?? 0;
-    const txCount1m = (buys + sells) / (usingM5Txns ? 5 : 60);
-
-    if (!isFiniteNumber(liquiditySol) || !isFiniteNumber(volume1mRaw)) return null;
-
-    const buySellRatio = sells > 0 ? buys / sells : buys > 0 ? Number.POSITIVE_INFINITY : 0;
+    const interpreted = interpretPair(pair, mint);
+    if (!interpreted || interpreted.liquiditySol === null) return null;
 
     return {
-      liquiditySol,
-      volume1mSol: volume1mRaw,
-      buySellRatio,
-      txCount1m,
+      liquiditySol: interpreted.liquiditySol,
+      volume1mSol: interpreted.volume1mSol,
+      volume5mSol: interpreted.volume5mSol,
+      buySellRatio: interpreted.buySellRatio,
+      txCount1m: interpreted.txCountPerMinute,
+      pairAddress: interpreted.pairAddress,
     };
   }
 
@@ -108,12 +86,12 @@ export class DexscreenerBirdeyeAggregator implements AggregatorClient {
     return { top10HolderPct };
   }
 
+  /** Price in SOL of the token, only from a provably TOKEN/SOL pair (priceNative of a USDC pair is USDC, not SOL). */
   async getPrice(mint: string): Promise<number | null> {
     const data = await this.fetchJson<DexscreenerResponse>(
       `${this.cfg.dexscreenerBaseUrl}/latest/dex/tokens/${encodeURIComponent(mint)}`,
     );
-    const pair = this.pickBestPair(data?.pairs);
-    const price = pair?.priceNative !== undefined ? Number(pair.priceNative) : undefined;
-    return isFiniteNumber(price) ? price : null;
+    const pair = pickTokenSolPair(data?.pairs, mint);
+    return pair ? (interpretPair(pair, mint)?.priceSol ?? null) : null;
   }
 }

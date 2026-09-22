@@ -1,11 +1,12 @@
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analytics.schema_contract import TRADES_COLUMNS, TRADES_TABLE
-from learning.db import open_learning_db
+from learning.db import open_learning_db, start_learning_run
 from learning.learner import run_learning_cycle
 
 # Matches the REAL column types in engine/src/ledger/migrations/001_init.ts
@@ -122,3 +123,77 @@ def test_learning_cycle_produces_candidates_only_as_pending(tmp_path):
         for row in rows:
             assert row["status"] == "pending"
             assert row["rejected"] == 0
+
+
+def test_learning_cycle_records_data_range_from_the_trades_it_processed(tmp_path):
+    trades = [{"pnl_sol": 0.01, "entry_time_ms": i * 1000} for i in range(60)]
+    db_path = make_ledger_with_trades(tmp_path, trades)
+
+    result = run_learning_cycle(str(db_path), strategy_version="V1")
+
+    with open_learning_db(str(db_path)) as conn:
+        row = conn.execute("SELECT * FROM learning_runs WHERE id = ?", (result.run_id,)).fetchone()
+        assert row["data_range_start_ms"] == 0
+        assert row["data_range_end_ms"] == 59_000
+
+
+def test_learning_cycle_refuses_to_start_while_another_run_is_in_flight(tmp_path):
+    trades = [{"pnl_sol": 0.01} for _ in range(60)]
+    db_path = make_ledger_with_trades(tmp_path, trades)
+
+    with open_learning_db(str(db_path)) as conn:
+        start_learning_run(conn, "run_stuck", "manual", started_at_ms=int(time.time() * 1000))
+
+    result = run_learning_cycle(str(db_path), strategy_version="V1")
+    assert result.status == "already_running"
+    assert result.run_id is None
+
+    with open_learning_db(str(db_path)) as conn:
+        rows = conn.execute("SELECT id FROM learning_runs").fetchall()
+        assert [r["id"] for r in rows] == ["run_stuck"]  # no duplicate run row was written
+
+
+def test_learning_cycle_incremental_skips_when_no_new_data_since_last_completed_run(tmp_path):
+    trades = [{"pnl_sol": 0.01, "entry_time_ms": i * 1000} for i in range(60)]
+    db_path = make_ledger_with_trades(tmp_path, trades)
+
+    first = run_learning_cycle(str(db_path), strategy_version="V1", incremental=True)
+    assert first.status == "completed"
+
+    second = run_learning_cycle(str(db_path), strategy_version="V1", incremental=True)
+    assert second.status == "no_new_data"
+    assert second.run_id is None
+
+    with open_learning_db(str(db_path)) as conn:
+        rows = conn.execute("SELECT id FROM learning_runs").fetchall()
+        assert len(rows) == 1  # the skipped incremental check never wrote a second run row
+
+
+def test_learning_cycle_incremental_runs_again_once_new_trades_exist(tmp_path):
+    trades = [{"pnl_sol": 0.01, "entry_time_ms": i * 1000} for i in range(60)]
+    db_path = make_ledger_with_trades(tmp_path, trades)
+    first = run_learning_cycle(str(db_path), strategy_version="V1", incremental=True)
+    assert first.status == "completed"
+
+    conn = sqlite3.connect(db_path)
+    for i in range(60):
+        row = {col: None for col in TRADES_COLUMNS}
+        row.update(
+            {
+                "id": f"trade_extra_{i}",
+                "mint": f"mint_extra_{i}",
+                "strategy_version": "V1",
+                "status": "closed",
+                "entry_time_ms": float(60_000 + i * 1000),
+                "reentry_index": 0.0,
+                "pnl_sol": 0.01,
+            }
+        )
+        placeholders = ", ".join("?" for _ in TRADES_COLUMNS)
+        conn.execute(f"INSERT INTO {TRADES_TABLE} VALUES ({placeholders})", [row[c] for c in TRADES_COLUMNS])
+    conn.commit()
+    conn.close()
+
+    second = run_learning_cycle(str(db_path), strategy_version="V1", incremental=True)
+    assert second.status == "completed"
+    assert second.sample_size == 120
