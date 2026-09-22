@@ -19,9 +19,44 @@ export interface FillResult {
   error?: string;
   /**
    * true when nothing was executed because a required input was UNAVAILABLE (price, impact, token amount) -- the
-   * position is intact and the same sell may be retried. false/absent = a genuine execution failure.
+   * position is intact and it is SAFE to retry the same sell automatically (bounded -- see positionMonitor.ts).
+   * false/absent means retrying automatically is not appropriate (see `executionOutcome` for why): either nothing
+   * ran and retrying would not help (e.g. a structurally missing token amount), or a real attempt's outcome is
+   * unconfirmed and retrying risks a DUPLICATE sell.
    */
   retryable?: boolean;
+  /**
+   * Explicit, authoritative execution outcome (bug fix following the DRY_RUN incident where a `success:false` fill
+   * that had executed NOTHING was still recorded as a closed position with a fabricated realized loss). This is the
+   * ONLY field `positionMonitor.ts` trusts to decide whether a sell actually happened -- `success`/`filledAmountSol`
+   * describe the resulting numbers, not whether they are real.
+   *
+   *   'executed'     -- the trade genuinely happened; filledAmountSol/filledPriceSol/fees are real and may be
+   *                      booked as a realized exit. Never combined with `success: false`.
+   *   'not_executed' -- nothing was sent or filled; the position is UNCHANGED. Safe to retry when `retryable` is
+   *                      also true (bounded); otherwise retrying would not help and the position needs
+   *                      reconciliation (never automatically closed, never given a fabricated PnL).
+   *   'unknown'      -- an attempt was made (e.g. a transaction was broadcast) but whether it landed could not be
+   *                      confirmed. MUST NOT be retried automatically under any circumstance -- doing so could
+   *                      execute a second, duplicate sell of a position that was already sold. Requires manual
+   *                      reconciliation of the real on-chain/venue state before this position trades again.
+   *
+   * Optional for backward compatibility: when omitted, the caller derives it as `success ? 'executed' : 'not_executed'`
+   * (see `resolveExecutionOutcome`) -- which is exactly what fixed the bug for every existing DRY_RUN failure case,
+   * none of which ever sends anything. A future live executor MUST set this explicitly, in particular `'unknown'`
+   * for its own ambiguous cases (timeouts, dropped confirmations) -- it must never rely on the `success:false`
+   * fallback to mean "executed", because the fallback can only ever produce `'not_executed'`.
+   */
+  executionOutcome?: 'executed' | 'not_executed' | 'unknown';
+}
+
+/**
+ * The authoritative interpretation of a fill's execution outcome (see `FillResult.executionOutcome`). Exported so
+ * both `positionMonitor.ts` and any future execution-outcome-aware code (e.g. a live executor's own retry guard)
+ * apply the exact same rule and can never independently reinvent (or misinterpret) it.
+ */
+export function resolveExecutionOutcome(fill: Pick<FillResult, 'success' | 'executionOutcome'>): 'executed' | 'not_executed' | 'unknown' {
+  return fill.executionOutcome ?? (fill.success ? 'executed' : 'not_executed');
 }
 
 export interface BuyParams {

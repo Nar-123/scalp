@@ -19,6 +19,9 @@ export class DryRunExecutor implements ExecutionEngine {
     private readonly logger?: Logger,
   ) {}
 
+  // Every failure path here is `executionOutcome: 'not_executed'`: DRY_RUN never sends a transaction, so a fill
+  // that did not compute simply never touched anything -- it can never be 'executed' and is never ambiguous
+  // enough to be 'unknown' (that outcome is reserved for a real executor's own unconfirmed broadcasts).
   private failedFill(error: string): FillResult {
     return {
       success: false,
@@ -31,6 +34,7 @@ export class DryRunExecutor implements ExecutionEngine {
       slippagePct: 0,
       priceImpactPct: 0,
       error,
+      executionOutcome: 'not_executed',
     };
   }
 
@@ -65,6 +69,7 @@ export class DryRunExecutor implements ExecutionEngine {
       tokenAmountRaw: quote.tokenAmountRaw,
       venueFeeBps: breakdown.feeBps,
       feeModel: breakdown.feeModel,
+      executionOutcome: 'executed',
     };
   }
 
@@ -103,6 +108,7 @@ export class DryRunExecutor implements ExecutionEngine {
       priceImpactPct: sellImpactPct,
       venueFeeBps: breakdown.feeBps,
       feeModel: breakdown.feeModel,
+      executionOutcome: 'executed',
     };
   }
 }

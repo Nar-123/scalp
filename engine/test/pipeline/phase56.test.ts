@@ -4,10 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { getDefaultConfig } from '../../src/config/defaults.js';
 import { DryRunExecutor } from '../../src/execution/dryRunExecutor.js';
 import { computeTradeFees, estimateRoundTrip, simulateFill } from '../../src/execution/fillSimulation.js';
-import type { FillResult, PriceSource } from '../../src/execution/types.js';
+import type { PriceSource } from '../../src/execution/types.js';
 import { openLedger } from '../../src/ledger/db.js';
-import { TradeLedger } from '../../src/ledger/tradeLedger.js';
-import { PositionMonitor } from '../../src/orchestrator/positionMonitor.js';
 import { isStaleAtDecision, MAX_MARKET_DATA_AGE_AT_DECISION_MS, MAX_SNAPSHOT_SKEW_MS, snapshotCoherenceIssues } from '../../src/orchestrator/snapshotCoherence.js';
 import { collectBaselineFilterFailures } from '../../src/orchestrator/baselineFilters.js';
 import { runReplay } from '../../src/backtest/replayEngine.js';
@@ -176,73 +174,9 @@ describe('2/3. execution direction and fees in the dry-run executor', () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-describe('position monitor: an unpriceable sell is deferred (position intact), then fails closed', () => {
-  function setup(sellResults: FillResult[]) {
-    const db = openLedger(':memory:');
-    const ledger = new TradeLedger(db);
-    const sells: unknown[] = [];
-    const executor = {
-      buy: async () => { throw new Error('no'); },
-      sell: async (p: unknown) => {
-        sells.push(p);
-        return sellResults.shift() ?? sellResults.at(-1)!;
-      },
-    };
-    const emergencyStop = { isTriggered: () => false, trigger: vi.fn() };
-    const monitor = new PositionMonitor(
-      { executor, priceSource: ps({ getPrice: vi.fn().mockResolvedValue(1) }), aggregator: { getPrice: async () => 1, getHolderConcentration: async () => null, getLiquidityAndVolume: async () => ({ liquiditySol: 40, volume1mSol: 1, buySellRatio: 1, txCount1m: 1 }) }, ledger, emergencyStop: emergencyStop as never, logger },
-      cfg,
-      HARD_RISK_PARAMETERS,
-    );
-    const now = Date.now();
-    ledger.recordEntry({
-      id: 't1', mint: 'M', poolAddress: null, strategyVersion: 'v', dryRun: true, reentryIndex: 0, entryTimeMs: now - 60_000, entryPriceSol: 1, entrySizeSol: 0.3, entryTokenAgeSec: 100,
-      entryLiquiditySol: 40, entryVolume1mSol: 6, entryBuySellRatio: 2, entryPriceVelocity5sPct: 2, entryVolumeAccelerationX: 2, entryScore: 5, entryScoreComponents: null, expectedNetEdgePct: 0.5,
-      expectedNetEdgeBreakdown: null, entrySlippagePct: 0.3, entryPriceImpactPct: 0.4, entryFeesSol: 0.001, entryTxSignature: null, entrySafetyCheckId: null, dailyRealizedPnlSolAtEntry: 0, entryTokenAmountRaw: '5000000',
-    });
-    const position = { tradeId: 't1', mint: 'M', poolAddress: null, entryTimeMs: now - 60_000, entryPriceSol: 1, entrySizeSol: 0.3, entryFilledAmountSol: 0.29, entryTokenAmountRaw: '5000000', entryFeesSol: 0.001, reentryIndex: 0, strategyVersion: 'v', dryRun: true, priceHistory: [{ priceSol: 1, liquiditySol: 40, timestampMs: now - 60_000 }], peakPriceSol: 1, troughPriceSol: 1 };
-    monitor.addPosition(position);
-    return { monitor, db, ledger, sells, emergencyStop };
-  }
-  const failed = (error: string, retryable: boolean, ts = Date.now()): FillResult => ({ success: false, filledPriceSol: 0, filledAmountSol: 0, feesSol: 0, txSignature: null, simulated: true, timestampMs: ts, slippagePct: 0, priceImpactPct: 0, error, retryable });
-  const ok = (): FillResult => ({ success: true, filledPriceSol: 1, filledAmountSol: 0.28, feesSol: 0.001, txSignature: null, simulated: true, timestampMs: Date.now(), slippagePct: 0.3, priceImpactPct: 0.9 });
-
-  it('passes the held raw token amount to the sell, defers while the sell cannot be priced, and closes with an exit context when it can', async () => {
-    const { monitor, ledger, sells, emergencyStop } = setup([failed('sell_price_impact_unavailable', true), ok()]);
-    // hold timeout (30 s) is long past for this position, so the exit engine asks for an exit on every poll
-    await (monitor as unknown as { pollAll(): Promise<void> }).pollAll();
-    expect(monitor.getOpenCount()).toBe(1); // deferred: nothing executed, position intact
-    expect(monitor.sellDeferrals).toBe(1);
-    expect(ledger.getOpenPositions()).toHaveLength(1);
-    expect(emergencyStop.trigger).not.toHaveBeenCalled();
-    await (monitor as unknown as { pollAll(): Promise<void> }).pollAll();
-    expect(monitor.getOpenCount()).toBe(0);
-    expect((sells[0] as { tokenAmountRaw: string }).tokenAmountRaw).toBe('5000000');
-    const row = ledger['db'].prepare('SELECT exit_context_json, exit_reason, status FROM trades WHERE id = ?').get('t1') as { exit_context_json: string; exit_reason: string; status: string };
-    expect(row.status).toBe('closed');
-    const ctx = JSON.parse(row.exit_context_json);
-    expect(ctx).toMatchObject({ sellPriceImpactPct: 0.9, exitFeesSol: 0.001, exitReason: row.exit_reason });
-    expect(ctx.netPnlSol).toBeCloseTo(0.28 - 0.3, 12);
-    expect(ctx.grossPnlSol).toBeCloseTo(0, 12);
-  });
-
-  it('a sell that stays unpriceable past the bound falls through to the existing fail-closed path (safety failure + emergency stop)', async () => {
-    const stale = Date.now() - 120_000;
-    const { monitor, emergencyStop } = setup([failed('sell_price_impact_unavailable', true, stale), failed('sell_price_impact_unavailable', true)]);
-    await (monitor as unknown as { pollAll(): Promise<void> }).pollAll(); // first deferral is stamped 120 s ago
-    await (monitor as unknown as { pollAll(): Promise<void> }).pollAll(); // second: beyond the 60 s bound
-    expect(monitor.getOpenCount()).toBe(0);
-    expect(emergencyStop.trigger).toHaveBeenCalled();
-  });
-
-  it('a non-retryable execution failure is not retried: it fails closed immediately', async () => {
-    const { monitor, emergencyStop } = setup([failed('sell_token_amount_unknown', false)]);
-    await (monitor as unknown as { pollAll(): Promise<void> }).pollAll();
-    expect(monitor.getOpenCount()).toBe(0);
-    expect(emergencyStop.trigger).toHaveBeenCalled();
-  });
-});
-
+// Position-monitor sell-failure-state coverage (deferred/retryable sells, non-executed failures, unknown execution
+// outcomes, and the "never fabricate a realized exit/PnL for a sell that did not execute" regression) now lives in
+// its own file: test/orchestrator/positionMonitor.test.ts.
 // ---------------------------------------------------------------------------------------------------------------------
 describe('4. expected net edge remains mandatory and fee-aware', () => {
   it('subtracts every configured cost of BOTH legs (fees, network+priority, slippage, price impact) plus the safety margin (Phase 5.6H: complete round trip)', () => {
