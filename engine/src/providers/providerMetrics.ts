@@ -18,6 +18,14 @@ export interface KindCounters {
   circuitOpened: number;
   circuitSkipped: number;
   shutdownAborted: number;
+  /**
+   * Category D (bug fix following the Phase 5.6J VPS incident): a logical request never even made an HTTP attempt at
+   * this endpoint because the LOCAL gate (rate-limit spacing or the concurrency queue) could not get it a slot
+   * before the logical request's own deadline. This is never evidence the upstream provider is unhealthy -- it never
+   * increments `consecutiveFailures` and can never open the circuit on its own. High counts here mean the gate's own
+   * `maxRequestsPerSecond`/`maxConcurrent`/`maxTotalMs` are undersized for the offered load, not that the provider is failing.
+   */
+  gateCapacityRejected: number;
   cacheHits: number;
   cacheMisses: number;
   dedupHits: number;
@@ -39,6 +47,7 @@ const zero = (): KindCounters => ({
   circuitOpened: 0,
   circuitSkipped: 0,
   shutdownAborted: 0,
+  gateCapacityRejected: 0,
   cacheHits: 0,
   cacheMisses: 0,
   dedupHits: 0,

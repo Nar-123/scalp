@@ -119,6 +119,19 @@ interface EndpointState {
 
 type AttemptResult = Omit<GateResponse, 'attempts' | 'latencyMs' | 'fromFallback'>;
 
+/**
+ * What happened trying this ONE endpoint for this logical request (bug fix, Phase 5.6J). `execute()` used to treat
+ * every non-success outcome the same way -- a bare `null` -- and count it toward `consecutiveFailures`/the circuit
+ * breaker. That conflated two completely different situations:
+ *
+ *  - 'failed': at least one real HTTP attempt was made (and its retries, if any, exhausted) without success. This is
+ *    genuine evidence the endpoint may be unhealthy and is what the circuit breaker exists to react to.
+ *  - 'not_attempted': the local gate (rate-limit spacing, or the concurrency queue) never handed out a slot before
+ *    the logical request's own deadline -- `fetchImpl` was never called. This says something about OUR OWN configured
+ *    capacity versus offered load, never about the upstream provider, and must never count toward the circuit.
+ */
+type EndpointOutcome = { kind: 'ok'; response: AttemptResult } | { kind: 'failed' } | { kind: 'not_attempted' };
+
 interface Seen {
   rate: boolean;
   timeout: boolean;
@@ -235,23 +248,27 @@ export class ProviderGate {
         const out = await this.tryEndpoint(st, req, deadline, () => {
           attempts += 1;
         }, seen);
-        if (out) {
+        if (out.kind === 'ok') {
           st.consecutiveFailures = 0;
-          this.metrics.recordProvider(kind, st.host, out.asOfMs);
-          return { ...out, attempts, latencyMs: out.asOfMs - startedAt, fromFallback: i > 0 };
+          this.metrics.recordProvider(kind, st.host, out.response.asOfMs);
+          return { ...out.response, attempts, latencyMs: out.response.asOfMs - startedAt, fromFallback: i > 0 };
         }
         if (this.isShutdown) break;
         // a method the endpoint will never serve is not an outage: it must not trip the circuit for other methods
         const structural = req.rpcMethod !== undefined && (st.unsupportedUntil.get(req.rpcMethod) ?? 0) > this.now();
-        if (!structural) {
+        if (structural) {
+          unsupported += 1;
+        } else if (out.kind === 'not_attempted') {
+          // the LOCAL gate never handed this endpoint a slot in time -- no HTTP attempt happened, so this is never
+          // evidence the endpoint is unhealthy: it must not count toward consecutiveFailures or open the circuit.
+          this.metrics.inc(kind, 'gateCapacityRejected');
+        } else {
           st.consecutiveFailures += 1;
           if (st.consecutiveFailures >= this.o.circuitFailureThreshold && st.openUntil <= this.now()) {
             st.openUntil = this.now() + this.o.circuitCooldownMs;
             this.metrics.inc(kind, 'circuitOpened');
             this.log?.warn({ host: st.host, kind }, 'provider circuit opened');
           }
-        } else {
-          unsupported += 1;
         }
         if (this.now() >= deadline) break;
       }
@@ -272,17 +289,22 @@ export class ProviderGate {
     }
   }
 
-  private async tryEndpoint(st: EndpointState, req: GateRequest, deadline: number, countAttempt: () => void, seen: Seen): Promise<AttemptResult | null> {
+  private async tryEndpoint(st: EndpointState, req: GateRequest, deadline: number, countAttempt: () => void, seen: Seen): Promise<EndpointOutcome> {
     const kind = this.o.kind;
     const signal = this.shutdownController.signal;
+    // Whether at least one HTTP attempt actually happened for this endpoint this logical request. Every early
+    // return before this becomes true is therefore 'not_attempted' -- never counted as a failed endpoint interaction.
+    let attemptedAtLeastOnce = false;
+    const notAttempted = (): EndpointOutcome => (attemptedAtLeastOnce ? { kind: 'failed' } : { kind: 'not_attempted' });
     for (let attempt = 0; attempt <= this.o.maxRetries; attempt += 1) {
-      if (signal.aborted) return null;
+      if (signal.aborted) return notAttempted();
       if (attempt > 0) this.metrics.inc(kind, 'retries');
       try {
-        if (!(await this.acquire(st, deadline, signal))) return null;
+        if (!(await this.acquire(st, deadline, signal))) return notAttempted();
       } catch {
-        return null;
+        return notAttempted();
       }
+      attemptedAtLeastOnce = true;
       let outcome: 'ok' | 'retry' | 'giveup';
       let delayMs = 0;
       let response: AttemptResult | null = null;
@@ -373,18 +395,18 @@ export class ProviderGate {
         signal.removeEventListener('abort', onShutdown);
         this.release(st);
       }
-      if (outcome === 'ok') return response;
-      if (outcome === 'giveup') return null;
+      if (outcome === 'ok') return { kind: 'ok', response: response as AttemptResult };
+      if (outcome === 'giveup') return { kind: 'failed' };
       // retry only if the wait fits in the remaining budget (a Retry-After beyond the budget means: give up on this endpoint)
-      if (attempt >= this.o.maxRetries) return null;
-      if (this.now() + delayMs >= deadline) return null;
+      if (attempt >= this.o.maxRetries) return { kind: 'failed' };
+      if (this.now() + delayMs >= deadline) return { kind: 'failed' };
       try {
         await this.sleep(delayMs, signal);
       } catch {
-        return null;
+        return { kind: 'failed' };
       }
     }
-    return null;
+    return notAttempted();
   }
 
   private backoff(attempt: number): number {

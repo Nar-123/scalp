@@ -133,3 +133,105 @@ describe('ProviderGate: explicit fallback', () => {
     expect(metrics.counters('rpc').fallbackUsed).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Bug fix regression (Phase 5.6J VPS incident): a logical request that never even attempted an HTTP call because the
+// LOCAL gate (rate-limit spacing or the concurrency queue) could not get it a slot before its own deadline used to be
+// treated exactly like a genuine failed endpoint interaction -- silently opening the provider circuit purely from
+// local scheduling pressure, even while every request that actually reached the network was succeeding. See
+// `EndpointOutcome` in providerGate.ts: `tryEndpoint` now distinguishes 'not_attempted' (zero HTTP attempts; never
+// counts toward `consecutiveFailures`, increments the new `gateCapacityRejected` metric instead) from 'failed' (at
+// least one real HTTP attempt happened and none succeeded; this is what may open the circuit).
+// ---------------------------------------------------------------------------------------------------------------------
+describe('ProviderGate: local gate saturation must never be mistaken for an upstream failure', () => {
+  it('acquire() rejects because the rate-limit slot would fall past the deadline: zero HTTP attempts, no consecutiveFailures, gateCapacityRejected increments instead', async () => {
+    const f = fakeFetch([ok]);
+    const t = 1_000_000;
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRequestsPerSecond: 1, maxRetries: 0, maxTotalMs: 500, circuitFailureThreshold: 1, now: () => t });
+    await g.execute({ method: 'POST' }); // consumes the only rate-limit slot for the next 1000ms
+    expect(f.calls.length).toBe(1);
+    const err = await g.execute({ method: 'POST' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(f.calls.length).toBe(1); // no second HTTP attempt was ever made
+    expect(metrics.counters('rpc').failures).toBe(0); // never counted as an HTTP failure
+    expect(metrics.counters('rpc').circuitOpened).toBe(0); // threshold=1 would have tripped instantly under the old bug
+    expect(metrics.counters('rpc').gateCapacityRejected).toBe(1);
+  });
+
+  it('repeated local scheduling rejections never open the circuit, however many accumulate', async () => {
+    const f = fakeFetch([ok]);
+    const t = 1_000_000;
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRequestsPerSecond: 1, maxRetries: 0, maxTotalMs: 500, circuitFailureThreshold: 3, now: () => t });
+    await g.execute({ method: 'POST' }); // consumes the slot
+    for (let i = 0; i < 10; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
+    expect(f.calls.length).toBe(1); // only the very first call ever reached the network
+    expect(metrics.counters('rpc').circuitOpened).toBe(0);
+    expect(metrics.counters('rpc').gateCapacityRejected).toBe(10);
+  });
+
+  it('genuine HTTP 5xx failures still open the circuit at the configured threshold (unaffected by the fix)', async () => {
+    const f = fakeFetch([{ status: 500 }]);
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRetries: 0, circuitFailureThreshold: 3 });
+    for (let i = 0; i < 3; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
+    expect(metrics.counters('rpc').circuitOpened).toBe(1);
+    expect(f.calls.length).toBe(3); // every one of these genuinely reached the network
+    expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+  });
+
+  it('genuine network errors still open the circuit at the configured threshold', async () => {
+    const f = fakeFetch([{ throws: true }]);
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRetries: 0, circuitFailureThreshold: 3 });
+    for (let i = 0; i < 3; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
+    expect(metrics.counters('rpc').circuitOpened).toBe(1);
+    expect(metrics.counters('rpc').networkErrors).toBe(3);
+    expect(f.calls.length).toBe(3);
+  });
+
+  it('genuine timeouts across separate logical requests still open the circuit at the configured threshold', async () => {
+    const f = fakeFetch([{ hang: true }]);
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, timeoutMs: 5, maxRetries: 0, circuitFailureThreshold: 3 });
+    for (let i = 0; i < 3; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
+    expect(metrics.counters('rpc').circuitOpened).toBe(1);
+    expect(metrics.counters('rpc').timeouts).toBe(3);
+  });
+
+  it('a successful response resets consecutiveFailures, so an interleaved success prevents the circuit from opening early', async () => {
+    const f = fakeFetch((i) => (i === 1 ? ok : { status: 500 }));
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRetries: 0, circuitFailureThreshold: 2 });
+    await g.execute({ method: 'POST' }).catch(() => undefined); // #1 (i=0): 500 -> consecutiveFailures=1
+    await g.execute({ method: 'POST' }); // #2 (i=1): ok -> resets to 0
+    await g.execute({ method: 'POST' }).catch(() => undefined); // #3 (i=2): 500 -> consecutiveFailures=1, NOT 2
+    expect(metrics.counters('rpc').circuitOpened).toBe(0);
+    await g.execute({ method: 'POST' }).catch(() => undefined); // #4 (i=3): 500 -> consecutiveFailures=2 -> opens
+    expect(metrics.counters('rpc').circuitOpened).toBe(1);
+  });
+
+  it('a structurally unsupported method never counts toward the outage circuit, however many times it recurs', async () => {
+    const f = fakeFetch([{ status: 429, headers: { 'x-ratelimit-method-limit': '0' } }]);
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, circuitFailureThreshold: 2 });
+    for (let i = 0; i < 5; i += 1) await g.execute({ method: 'POST', rpcMethod: 'getTokenLargestAccounts' }).catch(() => undefined);
+    expect(metrics.counters('rpc').circuitOpened).toBe(0);
+    expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+    expect(f.calls.length).toBe(1); // remembered after the first response, never hit again
+  });
+
+  it('reproduces the Phase 5.6J VPS pattern -- heavy offered load against a small gate produces mostly local rejections, and the circuit never opens from them', async () => {
+    const f = fakeFetch(() => ok); // whenever an attempt DOES reach the network it always succeeds, matching the VPS observation (751/755 successful, 0 failures, 0 timeouts on delivered requests)
+    const { gate: g, metrics } = gate({
+      fetchImpl: f.fn,
+      maxConcurrent: 1,
+      maxRequestsPerSecond: 5,
+      maxRetries: 0,
+      maxTotalMs: 30,
+      circuitFailureThreshold: 3,
+    });
+    const results = await Promise.allSettled(Array.from({ length: 50 }, () => g.execute({ method: 'POST' })));
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    expect(failed).toBeGreaterThan(0); // most of the 50 could not get a local slot before their own deadline
+    expect(metrics.counters('rpc').circuitOpened).toBe(0); // none of that opened the circuit
+    expect(metrics.counters('rpc').gateCapacityRejected).toBeGreaterThan(0);
+    expect(metrics.counters('rpc').failures).toBe(0); // zero genuine HTTP failures occurred -- every rejection was local
+    expect(metrics.counters('rpc').requests).toBe(metrics.counters('rpc').successes); // whatever DID reach the network succeeded
+    expect(g.pending).toBe(0);
+  });
+});
