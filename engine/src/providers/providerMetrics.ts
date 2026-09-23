@@ -19,11 +19,15 @@ export interface KindCounters {
   circuitSkipped: number;
   shutdownAborted: number;
   /**
-   * Category D (bug fix following the Phase 5.6J VPS incident): a logical request never even made an HTTP attempt at
-   * this endpoint because the LOCAL gate (rate-limit spacing or the concurrency queue) could not get it a slot
-   * before the logical request's own deadline. This is never evidence the upstream provider is unhealthy -- it never
-   * increments `consecutiveFailures` and can never open the circuit on its own. High counts here mean the gate's own
-   * `maxRequestsPerSecond`/`maxConcurrent`/`maxTotalMs` are undersized for the offered load, not that the provider is failing.
+   * Bug fix following the Phase 5.6J VPS incident, extended by the P2 starvation fix: counts every logical request
+   * whose non-success outcome was attributable to OUR OWN local scheduling, never to the upstream provider. Two
+   * cases land here: (1) the local gate (rate-limit spacing or the concurrency queue) never handed out a slot before
+   * the logical request's own deadline -- no HTTP attempt happened at all; (2) a slot WAS granted and an HTTP
+   * attempt WAS dispatched, but this logical request's remaining budget left less than a full `timeoutMs` for it, so
+   * our own abort timer fired before the endpoint got a fair (non-truncated) chance to answer. Neither is evidence
+   * the upstream provider is unhealthy -- neither increments `consecutiveFailures` and neither can open the circuit
+   * on its own. High counts here mean the gate's own `maxRequestsPerSecond`/`maxConcurrent`/`maxTotalMs` are
+   * undersized for the offered load, not that the provider is failing.
    */
   gateCapacityRejected: number;
   cacheHits: number;

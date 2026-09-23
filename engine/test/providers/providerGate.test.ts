@@ -237,19 +237,30 @@ describe('ProviderGate: local gate saturation must never be mistaken for an upst
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// P2 fix: near-deadline local pressure. Phase 5.6J (above) fixed the case where the local gate never hands out a
-// slot at all before the deadline. This fixes the ADJACENT case: the gate DOES hand out a slot, but so close to the
-// deadline that the HTTP attempt that follows gets a truncated timeout budget (`Math.min(this.o.timeoutMs, deadline
-// - t0)` in tryEndpoint) -- a slow-but-healthy upstream response then looks exactly like a genuine provider
-// timeout, wrongly counting toward `consecutiveFailures`/the circuit breaker for what was really just local
-// scheduling pressure. `acquire()` now refuses the slot (routed through the SAME 'not_attempted' path as Phase
-// 5.6J) whenever less than a full `timeoutMs` remains before the deadline.
+// P2 starvation fix. An EARLIER version of this fix made `acquire()` itself refuse a slot whenever less than a full
+// `timeoutMs` remained after waiting on rate-limit spacing or the concurrency queue -- meant to stop a
+// truncated-timeout HTTP attempt from looking like a genuine provider failure. That check was ITSELF a bug: on the
+// VPS, under real sustained contention, a request that has to wait ANY amount for a slot will almost always have
+// less than a full `timeoutMs` left by the time it is granted one. Once contention began, EVERY subsequent waiter
+// self-rejected without ever dispatching a real HTTP attempt, no slot was ever genuinely used or freed for reuse,
+// and each self-rejecting call had ALREADY advanced the shared rate-limit clock (`st.nextSlotAt`) before rejecting
+// itself -- permanently outracing real wall-clock time. RPC `requests`/`successes` froze for 15+ minutes on the VPS
+// while `gateCapacityRejected` absorbed 100% of new demand, with zero recovery.
+//
+// The fix (see `acquire()`/`tryEndpoint()` in providerGate.ts) moves the "was this a fair test of the endpoint"
+// judgment from BEFORE the attempt (refuse the slot) to AFTER it (classify the outcome): `acquire()` grants a slot
+// to anyone with any genuine time left, exactly as it did before either P2 patch; `tryEndpoint` then computes
+// `budgetTruncated` from the ACTUAL remaining budget at attempt time and, only if the attempt's own abort timer
+// fires (`timedOut`) AND that budget was truncated, classifies it as `EndpointOutcome` kind `'local_deadline'` --
+// counted in `gateCapacityRejected`, never in `failures`/`timeouts`, never opening the circuit. A genuine timeout
+// with a full (non-truncated) budget, a genuine network error, or a genuine 5xx are all unaffected regardless of
+// contention, because none of them depend on how much of our own budget was left.
 // ---------------------------------------------------------------------------------------------------------------------
-describe('ProviderGate: a slot must not be granted with less than a full attempt-timeout of budget remaining', () => {
+describe('ProviderGate: P2 starvation fix -- local deadline pressure must never be mistaken for a provider failure, and must never cause permanent starvation', () => {
   /**
-   * A real (fake-timer-driven) delay: resolves after `ms`, so `acquire()`'s concurrency wait genuinely spends wall-
-   * clock time -- unlike `instantSleep`, which resolves immediately and so never lets a "how much budget is left
-   * NOW" check see anything but the start of the window. Requires `vi.useFakeTimers()` to be active.
+   * A real (fake-timer-driven) delay: resolves after `ms`, so `acquire()`'s concurrency/rate wait genuinely spends
+   * wall-clock time -- unlike `instantSleep`, which resolves immediately and so never lets a "how much budget is
+   * left NOW" computation see anything but the start of the window. Requires `vi.useFakeTimers()` to be active.
    */
   const timedSleep = (ms: number, signal: AbortSignal): Promise<void> =>
     new Promise((resolve, reject) => {
@@ -264,7 +275,7 @@ describe('ProviderGate: a slot must not be granted with less than a full attempt
       }, { once: true });
     });
 
-  /** A slot held by `holdMs` before its fetch resolves -- used to make a SECOND, concurrent request wait exactly that long for a concurrency slot, simulating time consumed by earlier local work in the SAME logical request. */
+  /** A slot held by `holdMs` before its fetch resolves 200 OK -- simulates one request occupying a concurrency slot for real wall-clock time. */
   function heldFetch(holdMs: number, calls: { n: number }): FetchLike {
     let first = true;
     return ((_url: string, _init: unknown) => {
@@ -277,7 +288,22 @@ describe('ProviderGate: a slot must not be granted with less than a full attempt
     }) as unknown as FetchLike;
   }
 
-  it('slot available with plenty of remaining budget -> a normal HTTP attempt happens', async () => {
+  /** Every call takes real (fake-timer) `latencyMs` to resolve 200 OK, and honors the abort signal like a real fetch would. */
+  function delayedFetch(latencyMs: number, calls: { n: number }): FetchLike {
+    return ((_url: string, init: { signal: AbortSignal }) => {
+      calls.n += 1;
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve(makeResponse(ok)), latencyMs);
+        init.signal.addEventListener('abort', () => {
+          clearTimeout(t);
+          reject(new Error('aborted'));
+        }, { once: true });
+      });
+    }) as unknown as FetchLike;
+  }
+
+  // 1. uncontended immediate request
+  it('1. uncontended immediate request -> a normal HTTP attempt with the full configured timeout, unaffected by anything here', async () => {
     const f = fakeFetch([ok]);
     const { gate: g, metrics } = gate({ fetchImpl: f.fn, timeoutMs: 200, maxTotalMs: 2000 });
     const res = await g.execute({ method: 'POST' });
@@ -286,21 +312,59 @@ describe('ProviderGate: a slot must not be granted with less than a full attempt
     expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
   });
 
-  it('near-deadline slot (remaining budget < timeoutMs) -> zero HTTP attempts, gateCapacityRejected increments, no failure counted', async () => {
+  // 2. rate-spacing wait
+  it('2. rate-spacing wait (plenty of budget left afterward) -> waits, then gets a normal full-budget attempt and succeeds', async () => {
     vi.useFakeTimers();
     try {
       const calls = { n: 0 };
-      // maxConcurrent: 1 -- the first request holds the only slot for 1950ms of a 2000ms budget; the second must
-      // wait for it, so by the time IT could be granted a slot only ~50ms remain -- well under the 200ms
-      // configured per-attempt timeout.
-      const { gate: g, metrics } = gate({ fetchImpl: heldFetch(1950, calls), maxConcurrent: 1, timeoutMs: 200, maxTotalMs: 2000, maxRetries: 0, sleep: timedSleep, now: () => Date.now() });
+      const { gate: g, metrics } = gate({ fetchImpl: delayedFetch(10, calls), maxRequestsPerSecond: 2, timeoutMs: 200, maxTotalMs: 5000, sleep: timedSleep, now: () => Date.now() });
       const p1 = g.execute({ method: 'POST' });
-      const p2 = g.execute({ method: 'POST' }).catch((e) => e);
-      await vi.advanceTimersByTimeAsync(1950);
+      await vi.advanceTimersByTimeAsync(10);
+      await p1;
+      const p2 = g.execute({ method: 'POST' }); // must wait ~500ms of rate spacing; 4500ms+ still remains afterward
+      await vi.advanceTimersByTimeAsync(510);
+      const res2 = await p2;
+      expect(res2.status).toBe(200);
+      expect(calls.n).toBe(2);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+      expect(metrics.counters('rpc').failures).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 3. concurrency wait
+  it('3. concurrency wait (plenty of budget left afterward) -> waits for the slot to free, then gets a normal attempt and succeeds', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      const { gate: g, metrics } = gate({ fetchImpl: heldFetch(50, calls), maxConcurrent: 1, timeoutMs: 200, maxTotalMs: 5000, maxRetries: 0, sleep: timedSleep, now: () => Date.now() });
+      const p1 = g.execute({ method: 'POST' });
+      const p2 = g.execute({ method: 'POST' });
+      await vi.advanceTimersByTimeAsync(50);
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.status).toBe(200);
+      expect(r2.status).toBe(200);
+      expect(calls.n).toBe(2); // the second genuinely got dispatched once the first released its slot
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 4. deadline expires while waiting (queued for a concurrency slot, own budget runs out before one frees)
+  it('4. deadline expires while queued for a concurrency slot -> not_attempted, gateCapacityRejected increments, no failure counted', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      const { gate: g, metrics } = gate({ fetchImpl: heldFetch(500, calls), maxConcurrent: 1, timeoutMs: 200, maxTotalMs: 100, maxRetries: 0, sleep: timedSleep, now: () => Date.now() });
+      const p1 = g.execute({ method: 'POST' }); // holds the only slot for 500ms
+      const p2 = g.execute({ method: 'POST' }).catch((e) => e); // its own 100ms budget runs out long before p1 releases
+      await vi.advanceTimersByTimeAsync(500);
       await p1;
       const err = await p2;
       expect(err).toBeInstanceOf(ProviderError);
-      expect(calls.n).toBe(1); // only the FIRST request's fetch was ever called
+      expect(calls.n).toBe(1); // the second request's fetchImpl was NEVER called
       expect(metrics.counters('rpc').failures).toBe(0);
       expect(metrics.counters('rpc').timeouts).toBe(0);
       expect(metrics.counters('rpc').gateCapacityRejected).toBe(1);
@@ -309,30 +373,91 @@ describe('ProviderGate: a slot must not be granted with less than a full attempt
     }
   });
 
-  it('a near-deadline local rejection never opens the circuit, however many accumulate', async () => {
+  // 5. waiter gets slot with limited remaining budget: (a) genuinely doesn't finish in the truncated window -> local_deadline, not a failure
+  it('5a. slot granted with a truncated budget, attempt does not finish in time -> local_deadline (gateCapacityRejected), never failures/timeouts', async () => {
     vi.useFakeTimers();
     try {
       const calls = { n: 0 };
-      const { gate: g, metrics } = gate({ fetchImpl: heldFetch(1950, calls), maxConcurrent: 1, timeoutMs: 200, maxTotalMs: 2000, maxRetries: 0, circuitFailureThreshold: 1, sleep: timedSleep, now: () => Date.now() });
+      // maxTotalMs 300, timeoutMs 200: the first request holds the slot for 250ms, so the second is granted its
+      // slot with only ~50ms left of its own 300ms budget (truncated well below the 200ms nominal timeoutMs). Its
+      // OWN fetch takes 150ms -- which would have comfortably finished inside a FULL 200ms window -- so it is our
+      // own truncation, not the endpoint, that causes this attempt to not finish in time.
+      const { gate: g, metrics } = gate({
+        fetchImpl: (async (url: string, init: { signal: AbortSignal }) => {
+          calls.n += 1;
+          if (calls.n === 1) return new Promise((resolve) => setTimeout(() => resolve(makeResponse(ok)), 250));
+          return new Promise((resolve, reject) => {
+            const t = setTimeout(() => resolve(makeResponse(ok)), 150);
+            init.signal.addEventListener('abort', () => {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+            }, { once: true });
+          });
+        }) as unknown as FetchLike,
+        maxConcurrent: 1,
+        timeoutMs: 200,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
       const p1 = g.execute({ method: 'POST' });
-      const rejections = Array.from({ length: 5 }, () => g.execute({ method: 'POST' }).catch(() => undefined));
-      await vi.advanceTimersByTimeAsync(1950);
+      const p2 = g.execute({ method: 'POST' }).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(250);
       await p1;
-      // The first queued waiter is woken by p1's release and rejected immediately by the near-deadline check; it
-      // never takes the slot, so it never wakes the next one -- each remaining waiter only resolves at its OWN
-      // ~2000ms concurrency-wait deadline (a pre-existing, equally-'not_attempted' path). Advance far enough to
-      // cover all of them.
-      await vi.advanceTimersByTimeAsync(300);
-      await Promise.all(rejections);
-      expect(calls.n).toBe(1);
-      expect(metrics.counters('rpc').circuitOpened).toBe(0); // threshold=1 would have tripped instantly under the old bug
-      expect(metrics.counters('rpc').gateCapacityRejected).toBe(5);
+      await vi.advanceTimersByTimeAsync(60); // the truncated ~50ms window elapses; p2's attempt was dispatched but cannot finish
+      const err = await p2;
+      expect(err).toBeInstanceOf(ProviderError);
+      expect(calls.n).toBe(2); // the second request's fetchImpl WAS dispatched this time (the key behavior change)
+      expect(metrics.counters('rpc').failures).toBe(0); // never counted as a genuine failure
+      expect(metrics.counters('rpc').timeouts).toBe(0); // never counted as a genuine timeout
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(1);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('a genuine HTTP timeout that DID receive its full configured budget still counts as a real failure and can open the circuit', async () => {
+  // 5b. slot granted with a truncated budget but the attempt finishes anyway -> a normal success (truncation alone never dooms a request)
+  it('5b. slot granted with a truncated budget, attempt finishes anyway -> counts as a normal success', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      const { gate: g, metrics } = gate({
+        fetchImpl: (async (url: string, init: { signal: AbortSignal }) => {
+          calls.n += 1;
+          if (calls.n === 1) return new Promise((resolve) => setTimeout(() => resolve(makeResponse(ok)), 250));
+          return new Promise((resolve, reject) => {
+            const t = setTimeout(() => resolve(makeResponse(ok)), 20); // fast: fits inside the ~50ms truncated window
+            init.signal.addEventListener('abort', () => {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+            }, { once: true });
+          });
+        }) as unknown as FetchLike,
+        maxConcurrent: 1,
+        timeoutMs: 200,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
+      const p1 = g.execute({ method: 'POST' });
+      const p2 = g.execute({ method: 'POST' });
+      await vi.advanceTimersByTimeAsync(250);
+      await p1;
+      await vi.advanceTimersByTimeAsync(25);
+      const res2 = await p2;
+      expect(res2.status).toBe(200);
+      expect(calls.n).toBe(2);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+      expect(metrics.counters('rpc').successes).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 6. genuine HTTP timeout with a FULL (non-truncated) budget -> still a real failure, still can open the circuit
+  it('6. genuine HTTP timeout with a full configured budget still counts as a real failure and can open the circuit', async () => {
     const f = fakeFetch([{ hang: true }]);
     const { gate: g, metrics } = gate({ fetchImpl: f.fn, timeoutMs: 5, maxTotalMs: 2000, maxRetries: 0, circuitFailureThreshold: 3 });
     for (let i = 0; i < 3; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
@@ -342,38 +467,320 @@ describe('ProviderGate: a slot must not be granted with less than a full attempt
     expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
   });
 
-  it('genuine HTTP 5xx failures are unaffected by this fix and still open the circuit', async () => {
-    const f = fakeFetch([{ status: 500 }]);
-    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRetries: 0, circuitFailureThreshold: 2 });
-    for (let i = 0; i < 2; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
-    expect(metrics.counters('rpc').circuitOpened).toBe(1);
-    expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
-  });
-
-  it('genuine network errors are unaffected by this fix and still open the circuit', async () => {
-    const f = fakeFetch([{ throws: true }]);
-    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRetries: 0, circuitFailureThreshold: 2 });
-    for (let i = 0; i < 2; i += 1) await g.execute({ method: 'POST' }).catch(() => undefined);
-    expect(metrics.counters('rpc').circuitOpened).toBe(1);
-    expect(metrics.counters('rpc').networkErrors).toBe(2);
-    expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
-  });
-
-  it('local saturation (near-deadline OR pure gate-capacity rejection) alone never opens the circuit, no matter how it is mixed with real traffic', async () => {
+  // 7. genuine network error, including under truncated-budget conditions -> still a real failure (never excused by truncation)
+  it('7. genuine network error still counts as a real failure even when the attempt had a truncated budget', async () => {
     vi.useFakeTimers();
     try {
       const calls = { n: 0 };
-      const { gate: g, metrics } = gate({ fetchImpl: heldFetch(1950, calls), maxConcurrent: 1, timeoutMs: 200, maxTotalMs: 2000, maxRetries: 0, circuitFailureThreshold: 2, sleep: timedSleep, now: () => Date.now() });
-      const first = g.execute({ method: 'POST' }); // a normal request that will succeed, holding the slot
-      const rejections = Array.from({ length: 6 }, () => g.execute({ method: 'POST' }).catch(() => undefined)); // queue behind it, each starved of budget by the time the slot frees
-      await vi.advanceTimersByTimeAsync(1950);
-      const res = await first;
-      await vi.advanceTimersByTimeAsync(300); // let every remaining waiter reach its own concurrency-wait deadline too
-      await Promise.all(rejections);
-      expect(res.status).toBe(200);
-      expect(metrics.counters('rpc').circuitOpened).toBe(0);
-      expect(metrics.counters('rpc').gateCapacityRejected).toBe(6);
+      const { gate: g, metrics } = gate({
+        fetchImpl: (async (_url: string, _init: unknown) => {
+          calls.n += 1;
+          if (calls.n === 1) return new Promise((resolve) => setTimeout(() => resolve(makeResponse(ok)), 250));
+          throw new Error('ECONNRESET'); // a network error does not depend on our timer at all
+        }) as unknown as FetchLike,
+        maxConcurrent: 1,
+        timeoutMs: 200,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
+      const p1 = g.execute({ method: 'POST' });
+      const p2 = g.execute({ method: 'POST' }).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(250);
+      await p1;
+      const err = await p2;
+      expect(err).toBeInstanceOf(ProviderError);
+      expect(calls.n).toBe(2);
+      expect(metrics.counters('rpc').networkErrors).toBe(1);
+      expect(metrics.counters('rpc').failures).toBe(1);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(0); // NOT excused as local-only -- this is genuine evidence
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 8. provider 5xx, including under truncated-budget conditions -> still a real failure (the provider DID answer)
+  it('8. genuine HTTP 5xx still counts as a real failure even when the attempt had a truncated budget', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      const { gate: g, metrics } = gate({
+        fetchImpl: (async (_url: string, _init: unknown) => {
+          calls.n += 1;
+          if (calls.n === 1) return new Promise((resolve) => setTimeout(() => resolve(makeResponse(ok)), 250));
+          return makeResponse({ status: 503 });
+        }) as unknown as FetchLike,
+        maxConcurrent: 1,
+        timeoutMs: 200,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
+      const p1 = g.execute({ method: 'POST' });
+      const p2 = g.execute({ method: 'POST' }).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(250);
+      await p1;
+      const err = await p2;
+      expect(err).toBeInstanceOf(ProviderError);
+      expect(calls.n).toBe(2);
+      expect(metrics.counters('rpc').http5xx).toBe(1);
+      expect(metrics.counters('rpc').failures).toBe(1);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 9. shutdown while waiting for a slot -> never counted as a provider failure, reported as a shutdown, not opened circuit
+  it('9. shutdown while queued for a concurrency slot -> reason "shutdown", no failures/gateCapacityRejected, no circuit effect', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      // heldFetch's mock fetch does not honor the abort signal (it just resolves after `holdMs` regardless, unlike
+      // a real fetch) -- kept short here so the test can advance fake time past it and let p1 settle naturally
+      // without depending on abort actually cutting it short.
+      const { gate: g, metrics } = gate({ fetchImpl: heldFetch(50, calls), maxConcurrent: 1, timeoutMs: 200, maxTotalMs: 8000, maxRetries: 0, circuitFailureThreshold: 1, sleep: timedSleep, now: () => Date.now() });
+      const p1 = g.execute({ method: 'POST' });
+      const p2 = g.execute({ method: 'POST' }).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(10);
+      g.shutdown();
+      await vi.advanceTimersByTimeAsync(10);
+      const err2 = await p2;
+      expect(err2).toBeInstanceOf(ProviderError);
+      expect(err2.reason).toBe('shutdown');
       expect(metrics.counters('rpc').failures).toBe(0);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(0);
+      expect(metrics.counters('rpc').circuitOpened).toBe(0);
+      await vi.advanceTimersByTimeAsync(50); // let p1's mock fetch (which ignores abort) settle naturally so nothing dangles
+      await p1.catch(() => undefined);
+      expect(g.pending).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 10. retry after a genuine failure still works normally post-fix (unaffected by the truncation logic)
+  it('10. retry after a genuine 5xx failure still succeeds normally', async () => {
+    const f = fakeFetch([{ status: 503 }, ok]);
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, maxRetries: 1 });
+    const res = await g.execute({ method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(f.calls.length).toBe(2);
+    expect(metrics.counters('rpc').retries).toBe(1);
+    expect(metrics.counters('rpc').http5xx).toBe(1);
+  });
+
+  // 11. circuit breaker behavior post-fix: genuine failures interleaved with heavy local truncation still open the circuit correctly
+  it('11. circuit breaker still opens from genuine failures even while local_deadline outcomes are also occurring, and local_deadline outcomes never contribute', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      const { gate: g, metrics } = gate({
+        // Odd calls (1st, 3rd, 5th...) are the "genuine work" holding the slot and always answering 500. Even calls
+        // (2nd, 4th...) are queued waiters that get truncated windows and never finish (local_deadline).
+        fetchImpl: (async (url: string, init: { signal: AbortSignal }) => {
+          calls.n += 1;
+          if (calls.n % 2 === 1) return new Promise((resolve) => setTimeout(() => resolve(makeResponse({ status: 500 })), 250));
+          return new Promise((resolve, reject) => {
+            const t = setTimeout(() => resolve(makeResponse(ok)), 150);
+            init.signal.addEventListener('abort', () => {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+            }, { once: true });
+          });
+        }) as unknown as FetchLike,
+        maxConcurrent: 1,
+        timeoutMs: 200,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        circuitFailureThreshold: 3,
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
+      // 3 rounds: each round is one genuine 500 (odd) + one queued truncated waiter (even, local_deadline).
+      for (let round = 0; round < 3; round += 1) {
+        const pOdd = g.execute({ method: 'POST' }).catch(() => undefined);
+        const pEven = g.execute({ method: 'POST' }).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(250);
+        await pOdd;
+        await vi.advanceTimersByTimeAsync(60);
+        await pEven;
+      }
+      expect(metrics.counters('rpc').http5xx).toBe(3); // 3 genuine failures
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(3); // 3 local_deadline outcomes, never counted as failures
+      expect(metrics.counters('rpc').circuitOpened).toBe(1); // opened from the 3 GENUINE failures alone
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 12. fallback endpoint behavior post-fix: a primary locally rejected (not_attempted) still leaves budget for the fallback
+  //
+  // Note: a TRUNCATED ('local_deadline') attempt, by construction, always consumes exactly its endpoint's remaining
+  // share of the shared deadline (`effectiveTimeoutMs = deadline - t0` when truncated) -- so a logical request can
+  // never have budget left for a fallback immediately after one. The scenario that legitimately leaves budget for a
+  // fallback is the OTHER local-rejection path: the rate-limit slot would fall PAST the deadline, which `acquire()`
+  // detects and refuses immediately, at whatever moment `now()` currently is -- not at the deadline itself.
+  it('12. fallback endpoint is still tried when the primary is locally rejected (not_attempted) and budget remains', async () => {
+    const f = fakeFetch(() => ok); // whichever endpoint is actually reached always succeeds
+    const t = 1_000_000;
+    const endpoints = [{ baseUrl: 'https://primary.example/' }, { baseUrl: 'https://backup.example/' }];
+    const { gate: g, metrics } = gate({ fetchImpl: f.fn, endpoints, maxRequestsPerSecond: 1, maxRetries: 0, maxTotalMs: 500, now: () => t });
+    const first = await g.execute({ method: 'POST' }); // consumes primary's only rate-limit slot for the next 1000ms; backup has its own independent state
+    expect(first.fromFallback).toBe(false);
+    const res = await g.execute({ method: 'POST' }); // primary: not_attempted (its next rate-limit slot would fall past this request's own deadline) -> falls through to backup immediately, which still has its full budget
+    expect(res.fromFallback).toBe(true);
+    expect(res.host).toBe('https://backup.example');
+    expect(metrics.counters('rpc').gateCapacityRejected).toBe(1); // primary's not_attempted outcome
+    expect(metrics.counters('rpc').failures).toBe(0);
+  });
+
+  // -----------------------------------------------------------------------------------------------------------------
+  // MANDATORY: reproduces the VPS smoke-test starvation pattern in two complementary ways.
+  //
+  // Part A shows a burst of contention degrades gracefully (mixed success/rejection, never a genuine failure, slots
+  // demonstrably get reused) and that the gate recovers immediately once the burst subsides.
+  //
+  // Part B isolates and directly proves the deeper mechanism: a large volume of requests that time out waiting for
+  // CONCURRENCY (never dispatching at all) must never poison the shared rate-limit clock (`st.nextSlotAt`) for
+  // whoever comes after them. This is the part the near-deadline reclassification ALONE does not cover -- under a
+  // bounded burst, "some requests never get a real chance" is unavoidable and not the bug; the bug was that the
+  // OLD acquire() reserved a rate-limit slot for every one of them regardless, so the clock kept running even
+  // though the network was never touched, which is what turned an ordinary bounded backlog into a one-way,
+  // non-recovering freeze (the VPS: RPC frozen for 15+ minutes, zero recovery, long after the triggering demand).
+  // Part B is deterministic (a single request holds the only slot indefinitely, so every other arrival is
+  // GUARANTEED to fail via a concurrency timeout, never a dispatch) -- no throughput/timing race to get unlucky on.
+  // -----------------------------------------------------------------------------------------------------------------
+  it('STARVATION REPRODUCTION (A): a burst of contention degrades gracefully -- mixed success/rejection, no genuine failures, circuit never opens, and the gate recovers immediately once the burst subsides', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      // maxConcurrent 2, timeoutMs 100, maxTotalMs 300 (ratio 3x, matching production's 4000ms/8000ms shape). A
+      // healthy endpoint answering in 80ms -- comfortably within a full 100ms window. A short (400ms), moderate
+      // (~2x true ~25 req/s capacity) burst -- not an indefinite firehose -- so the burst genuinely subsides rather
+      // than describing a workload no scheduling policy could ever serve.
+      const { gate: g, metrics } = gate({
+        fetchImpl: delayedFetch(80, calls),
+        maxConcurrent: 2,
+        maxRequestsPerSecond: 30,
+        timeoutMs: 100,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        circuitFailureThreshold: 3,
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
+
+      const settled: Array<{ ok: boolean }> = [];
+      const pending: Promise<void>[] = [];
+      const TICK_MS = 40;
+      const TICKS = 10; // 10 * 40ms = 400ms burst
+      for (let tick = 0; tick < TICKS; tick += 1) {
+        for (let k = 0; k < 2; k += 1) {
+          pending.push(
+            g
+              .execute({ method: 'POST' })
+              .then(() => void settled.push({ ok: true }))
+              .catch(() => void settled.push({ ok: false })),
+          );
+        }
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+      }
+      // Burst STOPS here. Drain generously -- every one of the 20 requests resolves one way or another well within this.
+      await vi.advanceTimersByTimeAsync(500);
+      await Promise.all(pending);
+
+      const succeeded = settled.filter((s) => s.ok).length;
+      const rejected = settled.length - succeeded;
+      expect(settled.length).toBe(20);
+      // Graceful degradation, not collapse: capacity was genuinely reused across more than just the first wave.
+      expect(succeeded).toBeGreaterThan(2);
+      expect(rejected).toBeGreaterThan(0); // this genuinely was a burst -- not everything could be served
+
+      // Nothing here is genuine provider evidence: the endpoint was healthy (always answered in 80ms) throughout.
+      expect(metrics.counters('rpc').failures).toBe(0);
+      expect(metrics.counters('rpc').timeouts).toBe(0);
+      expect(metrics.counters('rpc').networkErrors).toBe(0);
+      expect(metrics.counters('rpc').circuitOpened).toBe(0);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBeGreaterThan(0);
+
+      // Recovery: the burst has now been over for 500ms (well past every prior request's own 300ms budget) -- a
+      // FRESH request must still be served promptly.
+      expect(g.pending).toBe(0);
+      const post = g.execute({ method: 'POST' });
+      await vi.advanceTimersByTimeAsync(90);
+      const postRes = await post;
+      expect(postRes.status).toBe(200);
+      expect(metrics.counters('rpc').circuitOpened).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('STARVATION REPRODUCTION (B): a CHAIN of truncated-window waiters -- freed slots keep getting reused cycle after cycle, never just discarded after the first, and a fresh request afterward still succeeds', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { n: 0 };
+      // Deterministic, repeated version of test 5a: a slot-holder followed by ONE queued waiter that is granted its
+      // slot with a truncated (sub-timeoutMs) budget and does not finish in time -- local_deadline, not a failure --
+      // repeated 5 TIMES IN A ROW. Under the OLD acquire()-level near-deadline rejection, the waiter in every single
+      // cycle would self-reject WITHOUT ever calling fetchImpl -- `calls.n` would stay at exactly the number of
+      // holders (5) for the whole chain, i.e. the "next waiter" NEVER actually gets to use the slot the previous
+      // one freed. Under the fix, every cycle's waiter genuinely dispatches (`calls.n` grows by 2 every cycle) --
+      // proving freed capacity is reused cycle after cycle, not silently lost after the first rejection, and that
+      // this holds however many times it repeats (no permanent lockup at any point in the chain).
+      let callN = 0;
+      const { gate: g, metrics } = gate({
+        fetchImpl: (async (_url: string, init: { signal: AbortSignal }) => {
+          callN += 1;
+          calls.n = callN;
+          if (callN % 2 === 1) return new Promise((resolve) => setTimeout(() => resolve(makeResponse(ok)), 250)); // the holder each cycle
+          return new Promise((resolve, reject) => {
+            // the waiter each cycle: granted ~50ms of truncated budget, needs 150ms -- would have comfortably
+            // finished inside a FULL 200ms window, so it is our own truncation, not the endpoint, at fault.
+            const t = setTimeout(() => resolve(makeResponse(ok)), 150);
+            init.signal.addEventListener('abort', () => {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+            }, { once: true });
+          });
+        }) as unknown as FetchLike,
+        maxConcurrent: 1,
+        timeoutMs: 200,
+        maxTotalMs: 300,
+        maxRetries: 0,
+        circuitFailureThreshold: 100, // isolate this test from circuit-breaker interaction entirely; nothing here should ever approach it anyway
+        sleep: timedSleep,
+        now: () => Date.now(),
+      });
+
+      const CYCLES = 5;
+      for (let cycle = 0; cycle < CYCLES; cycle += 1) {
+        const holder = g.execute({ method: 'POST' });
+        const waiter = g.execute({ method: 'POST' }).catch((e) => e);
+        await vi.advanceTimersByTimeAsync(250);
+        await holder;
+        await vi.advanceTimersByTimeAsync(60);
+        const err = await waiter;
+        expect(err).toBeInstanceOf(ProviderError);
+      }
+
+      expect(calls.n).toBe(CYCLES * 2); // EVERY cycle's waiter genuinely dispatched -- capacity was reused every single time, not just the first
+      expect(metrics.counters('rpc').failures).toBe(0); // none of the 5 truncated waiters was ever counted as a genuine failure
+      expect(metrics.counters('rpc').timeouts).toBe(0);
+      expect(metrics.counters('rpc').circuitOpened).toBe(0);
+      expect(metrics.counters('rpc').gateCapacityRejected).toBe(CYCLES); // exactly the 5 truncated waiters, nothing more
+      expect(metrics.counters('rpc').successes).toBe(CYCLES); // exactly the 5 holders
+
+      // No permanent lockup at the end of the chain either: a fresh, unrelated request succeeds normally.
+      expect(g.pending).toBe(0);
+      const post = g.execute({ method: 'POST' });
+      await vi.advanceTimersByTimeAsync(260);
+      const postRes = await post;
+      expect(postRes.status).toBe(200);
+      expect(metrics.counters('rpc').circuitOpened).toBe(0);
     } finally {
       vi.useRealTimers();
     }
