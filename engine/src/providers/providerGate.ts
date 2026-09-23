@@ -120,17 +120,28 @@ interface EndpointState {
 type AttemptResult = Omit<GateResponse, 'attempts' | 'latencyMs' | 'fromFallback'>;
 
 /**
- * What happened trying this ONE endpoint for this logical request (bug fix, Phase 5.6J). `execute()` used to treat
- * every non-success outcome the same way -- a bare `null` -- and count it toward `consecutiveFailures`/the circuit
- * breaker. That conflated two completely different situations:
+ * What happened trying this ONE endpoint for this logical request (bug fix, Phase 5.6J, extended by the P2
+ * starvation fix below). `execute()` used to treat every non-success outcome the same way -- a bare `null` -- and
+ * count it toward `consecutiveFailures`/the circuit breaker. That conflated situations that must be told apart:
  *
- *  - 'failed': at least one real HTTP attempt was made (and its retries, if any, exhausted) without success. This is
- *    genuine evidence the endpoint may be unhealthy and is what the circuit breaker exists to react to.
+ *  - 'failed': at least one real HTTP attempt was made (and its retries, if any, exhausted) without success, WITH a
+ *    fair (non-truncated) per-attempt timeout budget throughout. This is genuine evidence the endpoint may be
+ *    unhealthy and is what the circuit breaker exists to react to.
  *  - 'not_attempted': the local gate (rate-limit spacing, or the concurrency queue) never handed out a slot before
  *    the logical request's own deadline -- `fetchImpl` was never called. This says something about OUR OWN configured
  *    capacity versus offered load, never about the upstream provider, and must never count toward the circuit.
+ *  - 'local_deadline': a slot WAS granted and an HTTP attempt WAS dispatched, but this logical request's own
+ *    remaining budget (`maxTotalMs`) left less than a full `timeoutMs` for it, our own abort timer fired first, and
+ *    the endpoint never got a fair chance to answer within its normal per-attempt window. Exactly like
+ *    'not_attempted', this is never evidence the endpoint is unhealthy -- see the P2 fix in `acquire()`/`tryEndpoint`
+ *    below for why this must be judged AFTER the attempt (by whether the timeout window was cut short), not by
+ *    refusing the slot up front.
  */
-type EndpointOutcome = { kind: 'ok'; response: AttemptResult } | { kind: 'failed' } | { kind: 'not_attempted' };
+type EndpointOutcome =
+  | { kind: 'ok'; response: AttemptResult }
+  | { kind: 'failed' }
+  | { kind: 'not_attempted' }
+  | { kind: 'local_deadline' };
 
 interface Seen {
   rate: boolean;
@@ -258,9 +269,11 @@ export class ProviderGate {
         const structural = req.rpcMethod !== undefined && (st.unsupportedUntil.get(req.rpcMethod) ?? 0) > this.now();
         if (structural) {
           unsupported += 1;
-        } else if (out.kind === 'not_attempted') {
-          // the LOCAL gate never handed this endpoint a slot in time -- no HTTP attempt happened, so this is never
-          // evidence the endpoint is unhealthy: it must not count toward consecutiveFailures or open the circuit.
+        } else if (out.kind === 'not_attempted' || out.kind === 'local_deadline') {
+          // Either the LOCAL gate never handed this endpoint a slot in time (no HTTP attempt happened), or it did
+          // but our own remaining budget cut the attempt's timeout window short before the endpoint got a fair
+          // chance to answer. Neither is evidence the endpoint is unhealthy: neither counts toward
+          // consecutiveFailures or opens the circuit.
           this.metrics.inc(kind, 'gateCapacityRejected');
         } else {
           st.consecutiveFailures += 1;
@@ -305,7 +318,7 @@ export class ProviderGate {
         return notAttempted();
       }
       attemptedAtLeastOnce = true;
-      let outcome: 'ok' | 'retry' | 'giveup';
+      let outcome: 'ok' | 'retry' | 'giveup' | 'local_deadline';
       let delayMs = 0;
       let response: AttemptResult | null = null;
       countAttempt();
@@ -314,10 +327,18 @@ export class ProviderGate {
       const t0 = this.now();
       const attemptController = new AbortController();
       let timedOut = false;
+      // P2 fix: the per-attempt timeout window this ONE attempt actually gets, clamped to whatever remains of the
+      // logical request's own `maxTotalMs` budget. When remaining budget is less than the full configured
+      // `timeoutMs`, this attempt is TRUNCATED -- not because the endpoint is slow, but because our own scheduling
+      // (rate spacing, concurrency queueing, or earlier retries in this same logical request) already spent some of
+      // the budget. See the `timedOut` handling below: whether THIS abort timer firing is treated as genuine
+      // provider evidence depends on whether the attempt got a fair (non-truncated) window.
+      const effectiveTimeoutMs = Math.max(1, Math.min(this.o.timeoutMs, deadline - t0));
+      const budgetTruncated = effectiveTimeoutMs < this.o.timeoutMs;
       const timer = setTimeout(() => {
         timedOut = true;
         attemptController.abort();
-      }, Math.max(1, Math.min(this.o.timeoutMs, deadline - t0)));
+      }, effectiveTimeoutMs);
       const onShutdown = (): void => attemptController.abort();
       signal.addEventListener('abort', onShutdown, { once: true });
       try {
@@ -375,17 +396,29 @@ export class ProviderGate {
           outcome = 'ok';
         }
       } catch {
-        this.metrics.inc(kind, 'failures');
-        this.metrics.endpointInc(st.host, 'failures');
         if (signal.aborted) {
+          this.metrics.inc(kind, 'failures');
+          this.metrics.endpointInc(st.host, 'failures');
           outcome = 'giveup';
+        } else if (timedOut && budgetTruncated) {
+          // P2 fix: OUR OWN remaining budget, not the upstream's health, is what cut this attempt short -- it never
+          // got the full configured `timeoutMs` to answer in. Never counted as `failures`/`timeouts`, never treated
+          // as evidence the endpoint is unhealthy (see EndpointOutcome 'local_deadline' above). A genuine HTTP
+          // timeout that DID receive its full budget still falls through to the branch below, unaffected.
+          outcome = 'local_deadline';
         } else if (timedOut) {
+          this.metrics.inc(kind, 'failures');
+          this.metrics.endpointInc(st.host, 'failures');
           this.metrics.inc(kind, 'timeouts');
           this.metrics.endpointInc(st.host, 'timeouts');
           seen.timeout = true;
           delayMs = this.backoff(attempt);
           outcome = 'retry';
         } else {
+          // A network error (connection refused, DNS failure, ...) is genuine evidence regardless of how much
+          // budget remained -- it does not depend on our own timer, only on the network/endpoint right now.
+          this.metrics.inc(kind, 'failures');
+          this.metrics.endpointInc(st.host, 'failures');
           this.metrics.inc(kind, 'networkErrors');
           delayMs = this.backoff(attempt);
           outcome = 'retry';
@@ -396,6 +429,7 @@ export class ProviderGate {
         this.release(st);
       }
       if (outcome === 'ok') return { kind: 'ok', response: response as AttemptResult };
+      if (outcome === 'local_deadline') return { kind: 'local_deadline' };
       if (outcome === 'giveup') return { kind: 'failed' };
       // retry only if the wait fits in the remaining budget (a Retry-After beyond the budget means: give up on this endpoint)
       if (attempt >= this.o.maxRetries) return { kind: 'failed' };
@@ -414,21 +448,47 @@ export class ProviderGate {
     return Math.round(exp * (0.75 + this.random() * 0.5));
   }
 
+  /**
+   * Hands out a slot for ONE HTTP attempt, or refuses because there is genuinely no time (or capacity) left before
+   * this logical request's own deadline.
+   *
+   * P2 starvation fix (this replaces an earlier version of this method that ALSO refused a slot whenever less than
+   * a full `timeoutMs` remained after waiting on rate-limit spacing or the concurrency queue -- intended to stop a
+   * truncated-timeout attempt from looking like a genuine provider failure, Phase 5.6J-adjacent). That check was
+   * itself the bug behind a VPS RPC-throughput freeze: under real, sustained contention, a request that has to wait
+   * ANY amount for a slot will almost always have less than a full `timeoutMs` left by the time it is granted one --
+   * so once contention began, EVERY subsequent waiter self-rejected, no attempt ever completed, no slot was ever
+   * genuinely used or freed for reuse, and (compounding it) `st.nextSlotAt` had already been advanced for each of
+   * those calls before they rejected themselves, permanently outracing real wall-clock time. The result was a
+   * one-way, non-recovering freeze -- confirmed on the VPS: RPC `requests`/`successes` frozen for 15+ minutes while
+   * `gateCapacityRejected` absorbed 100% of new demand.
+   *
+   * The fix moves the "was this a fair test of the endpoint" judgment from HERE (before the attempt, based on a
+   * blanket "did you wait" flag) to `tryEndpoint`, AFTER the attempt, based on whether ITS OWN timeout window was
+   * actually truncated (`budgetTruncated`, computed from real remaining budget at attempt time, not from whether
+   * `acquire()` happened to wait). This method now grants a slot to every caller with any genuine time left --
+   * exactly its pre-Phase-5.6J shape -- so a granted slot is ALWAYS used for a real HTTP attempt: `st.active` is
+   * always incremented before returning `true` and always properly released afterward (in `tryEndpoint`'s `finally`
+   * block), so capacity is never silently lost and the concurrency queue keeps draining even under sustained load.
+   */
   private async acquire(st: EndpointState, deadline: number, signal: AbortSignal): Promise<boolean> {
-    const spacing = this.o.maxRequestsPerSecond > 0 ? 1000 / this.o.maxRequestsPerSecond : 0;
-    const t = this.now();
-    const slot = Math.max(t, st.nextSlotAt);
-    if (slot >= deadline) return false;
-    st.nextSlotAt = slot + spacing;
-    // Tracks whether THIS call actually waited on something (rate-limit spacing or a concurrency slot) -- see the
-    // P2 near-deadline check below, which only applies when it did.
-    let waited = false;
-    if (slot > t) {
-      waited = true;
-      await this.sleep(slot - t, signal);
-    }
+    // Concurrency is secured FIRST; the rate-limit spacing reservation (`st.nextSlotAt`) is committed LAST, only
+    // once a concurrency slot is actually in hand -- deliberately reordered from a naive "reserve the rate slot,
+    // then wait for concurrency" shape.
+    //
+    // Reserving a rate-limit slot BEFORE knowing whether a concurrency slot will even become available lets a call
+    // that ultimately times out waiting for concurrency still permanently push the shared rate-limit clock ahead of
+    // real time -- for a request that never reached the network. Under SUSTAINED overload (offered load exceeding
+    // serviceable capacity for an extended period -- e.g. many watched tokens ticking indefinitely, never stopping,
+    // exactly the real orchestrator's shape), that drift from purely-phantom reservations compounds without bound:
+    // minutes of accumulated drift make the rate-limit clock permanently outrun real time, so EVERY future caller's
+    // reserved slot keeps landing beyond its own deadline regardless of how much real capacity is actually free.
+    // This is what turns an ordinary, bounded local-scheduling backlog into a one-way, non-recovering freeze (the
+    // VPS pattern: RPC `requests`/`successes` frozen for 15+ minutes while `gateCapacityRejected` absorbed 100% of
+    // new demand). Committing the rate-limit reservation only once a concurrency slot is genuinely secured keeps
+    // that clock truthful: it only ever advances for logical requests that are actually about to dispatch an HTTP
+    // attempt, never for phantom reservations behind work that never happened.
     if (st.active >= this.o.maxConcurrent) {
-      waited = true;
       const remaining = deadline - this.now();
       if (remaining <= 0) return false;
       const got = await new Promise<boolean>((resolve) => {
@@ -445,25 +505,28 @@ export class ProviderGate {
         st.waiters.push(wake);
       });
       if (!got || signal.aborted) return false;
+      // Winning the wake-up IS claiming the concurrency slot: commit `st.active` immediately, before any further
+      // await, so no other caller can race in and also see room during the rate-limit spacing step below.
+      st.active += 1;
+    } else {
+      st.active += 1;
     }
-    // P2 near-deadline fix: a slot is only worth taking if a NORMAL attempt -- the full configured per-attempt
-    // timeout -- can still fit before this logical request's own deadline. Gated on `waited`: an UNCONTENDED
-    // request (no rate-limit spacing, no concurrency queueing) reaches here within microseconds of `execute()`
-    // capturing its deadline, and must never be rejected over ordinary JS-engine/event-loop timing noise -- a
-    // config with `timeoutMs === maxTotalMs` (give one attempt the whole budget, no room for retries) is
-    // legitimate and must still work. It is specifically a request that WAITED for local capacity -- the scenario
-    // the bug describes -- whose remaining budget can legitimately shrink below a full attempt-timeout. Without
-    // this check, that near-deadline slot would hand `tryEndpoint` a TRUNCATED timeout budget (see `Math.min(
-    // this.o.timeoutMs, deadline - t0)` there): a slow but perfectly healthy upstream response then looks exactly
-    // like a genuine provider timeout, incrementing `consecutiveFailures` and potentially opening the circuit from
-    // what was really just local scheduling pressure. That is LOCAL capacity exhaustion, not evidence of an
-    // unhealthy endpoint: refusing the slot here routes it through the exact same `not_attempted` path (see
-    // `EndpointOutcome`, Phase 5.6J) as every other "no slot in time" rejection -- `gateCapacityRejected`
-    // increments, `consecutiveFailures` and the circuit breaker are untouched. A genuine HTTP timeout that DID get
-    // its full configured budget is unaffected.
-    if (waited && deadline - this.now() < this.o.timeoutMs) return false;
-    st.active += 1;
-    return true;
+    let claimed = true; // whether the concurrency slot above still needs to be given back on this path
+    try {
+      const spacing = this.o.maxRequestsPerSecond > 0 ? 1000 / this.o.maxRequestsPerSecond : 0;
+      const t = this.now();
+      const slot = Math.max(t, st.nextSlotAt);
+      if (slot >= deadline) return false; // rate-limit spacing cannot be honored within what remains of the budget
+      st.nextSlotAt = slot + spacing;
+      if (slot > t) await this.sleep(slot - t, signal);
+      if (signal.aborted) return false;
+      claimed = false; // committed: the caller now owns the slot and will `release()` it after the HTTP attempt
+      return true;
+    } finally {
+      // Rate-limit spacing failed, or the wait was aborted: give the concurrency slot straight to the next queued
+      // waiter instead of leaving it silently idle -- exactly as if a genuine attempt had just finished.
+      if (claimed) this.release(st);
+    }
   }
 
   private release(st: EndpointState): void {
