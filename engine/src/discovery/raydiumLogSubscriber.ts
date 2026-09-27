@@ -4,6 +4,7 @@ import type { DiscoveredTokenEvent } from '../types/token.js';
 import type { TokenDiscoverySource } from './types.js';
 import type { Logger } from '../logging/logger.js';
 import { detectRaydiumAmmV4PoolCreation, RAYDIUM_AMM_V4_PROGRAM_ID } from './creationDetector.js';
+import { FetchRateLimiter } from './fetchRateLimiter.js';
 
 export interface RaydiumLogSubscriberOptions {
   programId: string;
@@ -29,6 +30,10 @@ export interface RaydiumLogSubscriberOptions {
    * docs/PHASE_1_1_DISCOVERY_VALIDATION.md). Use a dedicated low-latency RPC
    * provider (with its own separate budget from pump.fun's) and raise this
    * in production.
+   *
+   * Implemented via the shared `FetchRateLimiter` (fetchRateLimiter.ts) -- extracted from this class's original
+   * inline implementation, byte-identical behavior, and now reused by `PumpFunLogSubscriber` too (which previously
+   * had no caller-side throttle at all; see the discovery RPC capacity freeze fix).
    */
   maxFetchesPerSecond?: number;
 }
@@ -40,9 +45,7 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
   private subscriptionId: number | null = null;
   private stopped = false;
   private readonly programPubkey: PublicKey;
-  private readonly maxFetchesPerSecond: number;
-  private fetchesThisWindow = 0;
-  private windowStartMs = Date.now();
+  private readonly fetchLimiter: FetchRateLimiter;
 
   constructor(
     private readonly connection: Connection,
@@ -50,7 +53,7 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
     private readonly logger?: Logger,
   ) {
     this.programPubkey = new PublicKey(options.programId);
-    this.maxFetchesPerSecond = options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND;
+    this.fetchLimiter = new FetchRateLimiter(options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND);
   }
 
   async start(onEvent: (event: DiscoveredTokenEvent) => void): Promise<void> {
@@ -85,22 +88,11 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
     }
   }
 
-  private allowFetch(): boolean {
-    const now = Date.now();
-    if (now - this.windowStartMs >= 1000) {
-      this.windowStartMs = now;
-      this.fetchesThisWindow = 0;
-    }
-    if (this.fetchesThisWindow >= this.maxFetchesPerSecond) return false;
-    this.fetchesThisWindow += 1;
-    return true;
-  }
-
   private async handleLogs(logs: Logs, onEvent: (event: DiscoveredTokenEvent) => void): Promise<void> {
     if (this.stopped) return;
     try {
       if (logs.err) return;
-      if (!this.allowFetch()) return;
+      if (!this.fetchLimiter.allow()) return;
 
       const tx = await this.connection.getParsedTransaction(logs.signature, {
         maxSupportedTransactionVersion: 1,
