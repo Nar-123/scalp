@@ -5,6 +5,7 @@ import type { TokenDiscoverySource } from './types.js';
 import type { Logger } from '../logging/logger.js';
 import { ownLogsMatchAnyMarker } from './programLogs.js';
 import { detectPumpFunCreation } from './creationDetector.js';
+import { FetchRateLimiter } from './fetchRateLimiter.js';
 
 /**
  * Cheap PRE-FILTER only, applied to the free `onLogs` push before spending
@@ -42,7 +43,29 @@ export interface PumpFunLogSubscriberOptions {
   commitment?: 'confirmed' | 'finalized';
   /** Upper bound on the RPC unsubscribe during stop() (default 3000 ms). */
   stopTimeoutMs?: number;
+  /**
+   * Discovery RPC capacity freeze fix: every log matching a creation marker used to trigger an UNTHROTTLED, fully
+   * concurrent `getParsedTransaction` call (fire-and-forget from the WS callback, no caller-side bound of any kind)
+   * -- unlike `RaydiumLogSubscriber`, which has always had its own `allowFetch()` cap. Pump.fun is a much
+   * higher-frequency creation source than Raydium AMM V4, so this was the dominant contributor to a real VPS
+   * incident: discovery's own RPC calls share the exact same `ProviderGate` ('rpc') the safety gate's evaluations
+   * depend on (see `providerStack.ts`'s single `connection`/`gateFetch(rpcGate)`), and `EvaluationScheduler`'s
+   * capacity planning (`loop.ts`) has no visibility into discovery's demand at all -- it can only bound
+   * EVALUATION's own concurrency. A sustained, otherwise-unremarkable Pump.fun creation rate (observed: ~65-83
+   * `getParsedTransaction` attempts/minute) was enough to keep the shared gate's `gateCapacityRejected` absorbing
+   * effectively 100% of new demand for 9+ hours, freezing both discovery and evaluation simultaneously, even though
+   * ProviderGate itself never misclassified any of it as a genuine provider failure (PR #5 held correctly
+   * throughout -- `failures`/`circuitOpened` stayed at their pre-incident values the entire time).
+   *
+   * Same caller-side, fixed-window throttle as Raydium's (`FetchRateLimiter`, extracted from Raydium's original
+   * inline implementation): a rejected event is skipped -- dropped, exactly like a `mightBeCreation()` miss or a
+   * caught exception already were -- never queued, retried, or re-enqueued, so this can never create an unbounded
+   * pending-promise backlog of its own. Default 1/s, matching Raydium's own default exactly.
+   */
+  maxFetchesPerSecond?: number;
 }
+
+const DEFAULT_MAX_FETCHES_PER_SECOND = 1;
 
 export class PumpFunLogSubscriber implements TokenDiscoverySource {
   readonly name = 'pumpfun';
@@ -50,6 +73,7 @@ export class PumpFunLogSubscriber implements TokenDiscoverySource {
   private stopped = false;
   private readonly programPubkey: PublicKey;
   private readonly markers: string[];
+  private readonly fetchLimiter: FetchRateLimiter;
 
   constructor(
     private readonly connection: Connection,
@@ -58,6 +82,7 @@ export class PumpFunLogSubscriber implements TokenDiscoverySource {
   ) {
     this.programPubkey = new PublicKey(options.programId);
     this.markers = options.creationLogMarkers ?? DEFAULT_PUMPFUN_CREATION_MARKERS;
+    this.fetchLimiter = new FetchRateLimiter(options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND);
   }
 
   async start(onEvent: (event: DiscoveredTokenEvent) => void): Promise<void> {
@@ -103,6 +128,13 @@ export class PumpFunLogSubscriber implements TokenDiscoverySource {
     if (this.stopped) return;
     try {
       if (!this.mightBeCreation(logs)) return;
+      // Caller-side throttle, checked BEFORE the RPC call is ever started (not after it reaches ProviderGate): a
+      // rejected event is skipped here, synchronously, with no promise created for it at all -- see
+      // `maxFetchesPerSecond` above for why this exists and why it is safe from unbounded-pending-promise growth.
+      if (!this.fetchLimiter.allow()) {
+        this.logger?.debug({ signature: logs.signature }, 'pumpfun creation-log fetch skipped by caller-side rate limiter');
+        return;
+      }
 
       const tx = await this.connection.getParsedTransaction(logs.signature, {
         maxSupportedTransactionVersion: 1,
