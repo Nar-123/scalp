@@ -7,9 +7,13 @@ import type { FetchLike } from '../../src/providers/providerGate.js';
 /**
  * FRESH REPRODUCTION, post-fix: exercises a REAL `PumpFunLogSubscriber` (not a conceptual model of one) whose
  * `getParsedTransaction` calls are wired through the SAME shared `ProviderGate` as simulated "evaluation" calls --
- * mirroring production's actual wiring (`providerStack.ts`'s single `connection`/`gateFetch(rpcGate)`, shared by
- * `DirectSafetyDataSource` and both discovery subscribers). This is the production fix's own end-to-end proof,
- * separate from the read-only investigation branch's conceptual reproduction.
+ * isolating PR #6's Pump.fun throttle specifically, deliberately WITHOUT the later `PriorityAdmissionGate` fix
+ * (`fix/priority-admission-rpc`) in the way: discovery and evaluation both call `gate.execute()` directly here,
+ * exactly as production wired it BEFORE that later fix (`providerStack.ts`'s single `connection`/`gateFetch
+ * (rpcGate)`, shared by `DirectSafetyDataSource` and both discovery subscribers). Production no longer wires it
+ * this way -- see `priorityAdmissionRpc.test.ts` for a reproduction against the CURRENT wiring (two `Connection`s,
+ * `priorityGateFetch`, admission-layer priority). This file still isolates PR #6's own throttle correctly because
+ * that throttle's job (bounding discovery's OWN offered rate) is unaffected by which layer sits above the gate.
  */
 describe('FRESH REPRODUCTION (post-fix): a real PumpFunLogSubscriber, throttled vs. unthrottled, sharing the evaluation RPC gate', () => {
   const PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
@@ -43,7 +47,7 @@ describe('FRESH REPRODUCTION (post-fix): a real PumpFunLogSubscriber, throttled 
       }, { once: true });
     });
 
-  /** A fake `Connection` whose `getParsedTransaction` is routed through the SAME shared gate -- exactly what `gateFetch(rpcGate)` does for the real `Connection` in `providerStack.ts`. */
+  /** A fake `Connection` whose `getParsedTransaction` is routed through the SAME shared gate -- exactly what `gateFetch(rpcGate)` did for the real `Connection` in `providerStack.ts` before the priority-admission fix (see the file-level comment above). */
   function connectionRoutedThroughGate(g: { execute: (req: { method: 'POST' }) => Promise<unknown> }) {
     let onLogsCb: ((logs: { signature: string; err: unknown; logs: string[] }, ctx: { slot: number }) => void) | null = null;
     const discoveryFetchCount = { n: 0 };

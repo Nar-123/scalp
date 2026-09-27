@@ -49,8 +49,10 @@ export interface PumpFunLogSubscriberOptions {
    * -- unlike `RaydiumLogSubscriber`, which has always had its own `allowFetch()` cap. Pump.fun is a much
    * higher-frequency creation source than Raydium AMM V4, so this was the dominant contributor to a real VPS
    * incident: discovery's own RPC calls share the exact same `ProviderGate` ('rpc') the safety gate's evaluations
-   * depend on (see `providerStack.ts`'s single `connection`/`gateFetch(rpcGate)`), and `EvaluationScheduler`'s
-   * capacity planning (`loop.ts`) has no visibility into discovery's demand at all -- it can only bound
+   * depend on (see `providerStack.ts`'s `connection`/`priorityGateFetch(rpcGate, rpcAdmission, 'low')` -- discovery
+   * and evaluation each get their own `Connection`/priority tag, but both still ultimately draw from this one
+   * gate's shared capacity), and `EvaluationScheduler`'s capacity planning (`loop.ts`) has no visibility into
+   * discovery's demand at all -- it can only bound
    * EVALUATION's own concurrency. A sustained, otherwise-unremarkable Pump.fun creation rate (observed: ~65-83
    * `getParsedTransaction` attempts/minute) was enough to keep the shared gate's `gateCapacityRejected` absorbing
    * effectively 100% of new demand for 9+ hours, freezing both discovery and evaluation simultaneously, even though
