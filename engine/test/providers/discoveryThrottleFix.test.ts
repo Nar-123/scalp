@@ -146,7 +146,7 @@ describe('FRESH REPRODUCTION (post-fix): a real PumpFunLogSubscriber, throttled 
       await vi.advanceTimersByTimeAsync(500);
 
       const rpc = metrics.counters('rpc');
-       
+
       console.log('UNTHROTTLED RESULT', { evalAttempts: evalSlots.evalAttempts, evalSuccesses: evalSlots.evalSuccesses, discoveryFetches: discoveryFetchCount.n, gateCapacityRejected: rpc.gateCapacityRejected, failures: rpc.failures, circuitOpened: rpc.circuitOpened });
 
       expect(evalSlots.evalSuccesses).toBeLessThan(evalSlots.evalAttempts / 2); // evaluation collapses, matching the old bug
@@ -188,7 +188,7 @@ describe('FRESH REPRODUCTION (post-fix): a real PumpFunLogSubscriber, throttled 
       await vi.advanceTimersByTimeAsync(500);
 
       const rpc = metrics.counters('rpc');
-       
+
       console.log('THROTTLED RESULT', { evalAttempts: evalSlots.evalAttempts, evalSuccesses: evalSlots.evalSuccesses, discoveryFetches: discoveryFetchCount.n, gateCapacityRejected: rpc.gateCapacityRejected, failures: rpc.failures, circuitOpened: rpc.circuitOpened });
 
       // Evaluation throughput is essentially unaffected -- the core fix proof.
