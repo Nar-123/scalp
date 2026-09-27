@@ -3,8 +3,9 @@ import type { AppConfig } from '../config/schema.js';
 import type { Logger } from '../logging/logger.js';
 import { JupiterQuoteClient } from '../execution/jupiterQuoteClient.js';
 import { CachedSafetyDataSource, DirectSafetyDataSource, type SafetyDataSource } from '../safety/dataSource.js';
-import { ProviderError, ProviderGate, type ProviderEndpoint } from './providerGate.js';
+import { ProviderError, ProviderGate, type ProviderEndpoint, type GateResponse } from './providerGate.js';
 import { ProviderMetrics } from './providerMetrics.js';
+import { PriorityAdmissionGate, type AdmissionPriority } from './priorityAdmissionGate.js';
 import { redactUrl, registerSecret, secretsInUrl } from './redact.js';
 
 /** Hosts of keyless public endpoints known NOT to serve the safety gate's methods (see docs/PHASE_5_6A_PROVIDER_RELIABILITY.md). */
@@ -48,20 +49,44 @@ function fallbackEndpoints(urls: readonly string[], apiKeys: readonly string[]):
   return urls.map((baseUrl, i) => endpointWithOwnCredential(baseUrl, apiKeys[i] || undefined));
 }
 
+function gateRequestFromInit(init?: { body?: unknown; headers?: unknown }): { method: 'POST'; body?: string; headers: Record<string, string>; rpcMethod?: string } {
+  const body = typeof init?.body === 'string' ? init.body : undefined;
+  let rpcMethod: string | undefined;
+  try {
+    const parsed = body ? (JSON.parse(body) as { method?: string } | Array<{ method?: string }>) : undefined;
+    rpcMethod = Array.isArray(parsed) ? parsed[0]?.method : parsed?.method;
+  } catch {
+    // not JSON: no method-level tracking
+  }
+  return { method: 'POST', ...(body !== undefined ? { body } : {}), headers: { 'content-type': 'application/json' }, ...(rpcMethod ? { rpcMethod } : {}) };
+}
+
+function gateResponseToFetchResponse(res: GateResponse): Response {
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
 /** A `fetch` for web3.js that sends every JSON-RPC HTTP call through the gate (limits, retries, fallback, shutdown). */
 export function gateFetch(gate: ProviderGate): typeof fetch {
   return (async (input: unknown, init?: { body?: unknown; headers?: unknown }) => {
     void input; // the URL is chosen by the gate (primary, then fallbacks); web3.js only knows the primary
-    const body = typeof init?.body === 'string' ? init.body : undefined;
-    let rpcMethod: string | undefined;
-    try {
-      const parsed = body ? (JSON.parse(body) as { method?: string } | Array<{ method?: string }>) : undefined;
-      rpcMethod = Array.isArray(parsed) ? parsed[0]?.method : parsed?.method;
-    } catch {
-      // not JSON: no method-level tracking
-    }
-    const res = await gate.execute({ method: 'POST', ...(body !== undefined ? { body } : {}), headers: { 'content-type': 'application/json' }, ...(rpcMethod ? { rpcMethod } : {}) });
-    return new Response(res.body, { status: res.status, headers: res.headers });
+    const res = await gate.execute(gateRequestFromInit(init));
+    return gateResponseToFetchResponse(res);
+  }) as unknown as typeof fetch;
+}
+
+/**
+ * Same as `gateFetch`, but every logical request first passes through a shared `PriorityAdmissionGate` (the
+ * shared-RPC-capacity fix, `investigate/shared-rpc-capacity`) before it ever reaches `gate.execute()`. `gate`
+ * itself -- its rate limit, concurrency bound, retries, circuit breaker -- is completely unchanged; this only
+ * decides ORDERING among callers contending for `gate`'s own `maxConcurrent` admission slots, always promoting a
+ * waiting 'high' (evaluation) caller ahead of a waiting 'low' (discovery) caller. See `priorityAdmissionGate.ts`
+ * for why this is safe from starvation and unbounded queueing.
+ */
+export function priorityGateFetch(gate: ProviderGate, admission: PriorityAdmissionGate, priority: AdmissionPriority): typeof fetch {
+  return (async (input: unknown, init?: { body?: unknown; headers?: unknown }) => {
+    void input;
+    const res = await admission.run(priority, () => gate.execute(gateRequestFromInit(init)));
+    return gateResponseToFetchResponse(res);
   }) as unknown as typeof fetch;
 }
 
@@ -103,9 +128,24 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
     metrics,
     logger,
   );
-  const connection = new Connection(cfg.rpc.httpUrl, { wsEndpoint: cfg.rpc.wsUrl, commitment: 'confirmed', fetch: gateFetch(rpcGate), disableRetryOnRateLimit: true });
+  // Shared-RPC-capacity fix (`investigate/shared-rpc-capacity`, Option A): evaluation and discovery both call
+  // `rpcGate.execute()` (directly or via `connection`'s fetch), and `rpcGate`'s own FIFO queue has no concept of
+  // caller identity -- under sustained combined load, discovery's contention could starve evaluation even after
+  // discovery's own offered rate was independently bounded (PR #6). `rpcAdmission` sits above `rpcGate`
+  // (completely unmodified) and always promotes a waiting evaluation ('high') caller ahead of a waiting discovery
+  // ('low') caller. Sized to `rpcGate`'s own `maxConcurrent`: no new capacity pool, no change to
+  // maxRequestsPerSecond/timeoutMs/maxTotalMs/maxConcurrent -- this only reorders who gets to attempt
+  // `rpcGate.execute()` next when more callers are ready than `rpcGate` can admit at once.
+  const rpcAdmission = new PriorityAdmissionGate(r.maxConcurrent);
+  // `connection`: used for discovery's WS log subscriptions (`onLogs`, unaffected -- `fetch` plays no part in
+  // that) AND discovery's own `getParsedTransaction` HTTP calls, both 'low' priority.
+  const connection = new Connection(cfg.rpc.httpUrl, { wsEndpoint: cfg.rpc.wsUrl, commitment: 'confirmed', fetch: priorityGateFetch(rpcGate, rpcAdmission, 'low'), disableRetryOnRateLimit: true });
+  // `evaluationConnection`: HTTP-only (never subscribes -- web3.js's WebSocket client is constructed with
+  // `autoconnect: false` and only ever connects when a subscribe method is called, so this never opens a second
+  // socket to the RPC provider), used solely by `DirectSafetyDataSource`'s evaluation-time RPC calls, 'high' priority.
+  const evaluationConnection = new Connection(cfg.rpc.httpUrl, { commitment: 'confirmed', fetch: priorityGateFetch(rpcGate, rpcAdmission, 'high'), disableRetryOnRateLimit: true });
   const jupiter = new JupiterQuoteClient({ jupiterQuoteBaseUrl: cfg.aggregators.jupiterQuoteBaseUrl, requestTimeoutMs: q.timeoutMs }, logger, { gate: quoteGate, metrics, cacheTtlMs: q.cacheTtlMs });
-  const direct = new DirectSafetyDataSource(connection);
+  const direct = new DirectSafetyDataSource(evaluationConnection);
   const safetyData = r.safetyDataTtlMs > 0 ? new CachedSafetyDataSource(direct, { ttlMs: r.safetyDataTtlMs, metrics }) : direct;
   const rpcClass = classifyRpcEndpoint(cfg.rpc.httpUrl);
   logger?.info(
@@ -124,6 +164,9 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
     safetyData,
     rpcClass,
     shutdown(): void {
+      // Admission first: any caller still WAITING for a ticket (never reached `rpcGate.execute()`) is rejected
+      // cleanly here rather than left waiting on a gate that's about to refuse everything anyway.
+      rpcAdmission.shutdown();
       rpcGate.shutdown();
       quoteGate.shutdown();
     },
