@@ -132,4 +132,145 @@ describe('ShadowLedger', () => {
     const open = ledger.getOpenPosition('V1', 'MINT_A');
     expect(open?.entryQuote).toEqual({ quotedPriceSol: 1.001, quoteTimestampMs: 999, route: 'raydium', expectedOutputSol: 0.3, estimatedPriceImpactPct: 0.2, estimatedSlippagePct: 0.3 });
   });
+
+  // investigate/production-fetch-abandon, Phase 1 (prepared-statement caching): every statement below is now
+  // prepared ONCE in the constructor and reused for the lifetime of the instance, instead of being re-prepared on
+  // every call. These tests target exactly the failure modes that reuse (rather than per-call prepare()) could
+  // introduce -- stale bound parameters leaking across calls, a statement left unusable after a constraint error,
+  // or a cached statement outliving a closed database differently than a fresh prepare() would.
+  describe('prepared-statement caching regression', () => {
+    it('repeated calls to the same cached statement never leak bound parameters from a previous call', () => {
+      // Same cached statement (stmtUpsertHealthCounter), many distinct logical calls, interleaved names/values.
+      ledger.incrementCounter('a', 1);
+      ledger.incrementCounter('b', 5);
+      ledger.incrementCounter('a', 2);
+      ledger.incrementCounter('c', 100);
+      ledger.incrementCounter('b', 1);
+      ledger.incrementCounter('a', 1);
+      expect(ledger.getCounters()).toEqual({ a: 4, b: 6, c: 100 });
+    });
+
+    it('repeated getOpenPosition calls for different mints never return a stale/previous row', () => {
+      ledger.recordEntry(makeTrade({ tradeId: 't1', strategyVersion: 'V1', mint: 'MINT_A' }));
+      ledger.recordEntry(makeTrade({ tradeId: 't2', strategyVersion: 'V1', mint: 'MINT_B' }));
+      // Interrogate the SAME cached statement (stmtSelectOpenPosition) back and forth, many times, across both keys
+      // and a key that doesn't exist -- a statement that retained state from a prior .get() would surface here.
+      for (let i = 0; i < 5; i++) {
+        expect(ledger.getOpenPosition('V1', 'MINT_A')?.tradeId).toBe('t1');
+        expect(ledger.getOpenPosition('V1', 'MINT_B')?.tradeId).toBe('t2');
+        expect(ledger.getOpenPosition('V1', 'MINT_NONEXISTENT')).toBeNull();
+        expect(ledger.getOpenPosition('V2', 'MINT_A')).toBeNull(); // right mint, wrong strategy
+      }
+    });
+
+    it('interleaved calls across every hot-path method (as a real evaluation tick would make them) stay isolated per strategy/mint', () => {
+      // Mirrors the real call order inside ShadowRunner.onMarketTick(): data-quality event, missed signal, latency
+      // sample and health counter, interleaved for two different strategies/mints in the same "tick batch" -- proving
+      // the caching doesn't cross-contaminate concurrent LOGICAL calls sharing one cached statement.
+      ledger.recordDataQualityEvent('dq_v1', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1000, kind: 'stale_market_data', severity: 'warning', detail: 'x' });
+      ledger.recordMissedSignal('m_v1', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1000, reason: 'reentry_cooldown_active', detail: 'v1-detail' });
+      ledger.recordDataQualityEvent('dq_v2', { mint: 'MINT_B', strategyVersion: 'V2', observedAtMs: 1001, kind: 'impossible_price_change', severity: 'block', detail: 'y' });
+      ledger.recordMissedSignal('m_v2', { mint: 'MINT_B', strategyVersion: 'V2', observedAtMs: 1001, reason: 'daily_loss_limit', detail: 'v2-detail' });
+      ledger.recordLatencySample('lat_v1', {
+        mint: 'MINT_A', observedAtMs: 1000, discoveryTimeMs: 0, signalTimeMs: 500, quoteTimeMs: null,
+        simulationTimeMs: 600, exitSignalTimeMs: null, discoveryLatencyMs: 500, signalLatencyMs: 100,
+        quoteLatencyMs: null, processingLatencyMs: 600,
+      });
+      ledger.incrementCounter('shadow_ticks_received', 1);
+      ledger.recordDataQualityEvent('dq_v1_second', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1002, kind: 'stale_market_data', severity: 'warning', detail: 'x2' });
+      ledger.incrementCounter('shadow_ticks_received', 1);
+
+      const v1Missed = ledger.getRecentMissedSignals('V1', 0);
+      const v2Missed = ledger.getRecentMissedSignals('V2', 0);
+      expect(v1Missed).toHaveLength(1);
+      expect(v1Missed[0]!.detail).toBe('v1-detail');
+      expect(v2Missed).toHaveLength(1);
+      expect(v2Missed[0]!.detail).toBe('v2-detail');
+
+      const dqEvents = ledger.getRecentDataQualityEvents(0);
+      expect(dqEvents).toHaveLength(3);
+      expect(dqEvents.filter((e) => e.strategyVersion === 'V1')).toHaveLength(2);
+      expect(dqEvents.filter((e) => e.strategyVersion === 'V2')).toHaveLength(1);
+
+      expect(ledger.getRecentLatencySamples(0)).toHaveLength(1);
+      expect(ledger.getCounters()).toEqual({ shadow_ticks_received: 2 });
+    });
+
+    it('a UNIQUE/PRIMARY KEY constraint violation throws, and the cached statement remains fully usable afterward', () => {
+      // recordEntry twice with the same tradeId -- shadow_trades.trade_id is PRIMARY KEY. This is the exact class of
+      // bug statement reuse (vs. a fresh prepare() every call) could introduce: does the cached StatementSync survive
+      // throwing mid-bind/execute and remain correctly usable for the NEXT, distinct call?
+      ledger.recordEntry(makeTrade({ tradeId: 'dup_1', mint: 'MINT_A' }));
+      expect(() => ledger.recordEntry(makeTrade({ tradeId: 'dup_1', mint: 'MINT_A' }))).toThrow();
+      // The cached stmtInsertTrade statement must still work for a fresh, non-conflicting call right after the error.
+      ledger.recordEntry(makeTrade({ tradeId: 'dup_2', mint: 'MINT_B' }));
+      expect(ledger.getOpenPositions('V1').map((p) => p.tradeId).sort()).toEqual(['dup_1', 'dup_2']);
+
+      // Same check for the other three PK-guarded INSERT statements used on the hot path.
+      ledger.recordMissedSignal('missed_dup', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1, reason: 'reentry_cooldown_active', detail: 'first' });
+      expect(() => ledger.recordMissedSignal('missed_dup', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 2, reason: 'reentry_cooldown_active', detail: 'second' })).toThrow();
+      ledger.recordMissedSignal('missed_ok', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 3, reason: 'reentry_cooldown_active', detail: 'third' });
+      expect(ledger.getRecentMissedSignals('V1', 0)).toHaveLength(2);
+
+      ledger.recordDataQualityEvent('dq_dup', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1, kind: 'stale_market_data', severity: 'warning', detail: 'first' });
+      expect(() => ledger.recordDataQualityEvent('dq_dup', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 2, kind: 'stale_market_data', severity: 'warning', detail: 'second' })).toThrow();
+      ledger.recordDataQualityEvent('dq_ok', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 3, kind: 'stale_market_data', severity: 'warning', detail: 'third' });
+      expect(ledger.getRecentDataQualityEvents(0)).toHaveLength(2);
+
+      ledger.recordLatencySample('lat_dup', {
+        mint: 'MINT_A', observedAtMs: 1, discoveryTimeMs: 0, signalTimeMs: 1, quoteTimeMs: null,
+        simulationTimeMs: 1, exitSignalTimeMs: null, discoveryLatencyMs: 1, signalLatencyMs: 1, quoteLatencyMs: null, processingLatencyMs: 1,
+      });
+      expect(() =>
+        ledger.recordLatencySample('lat_dup', {
+          mint: 'MINT_A', observedAtMs: 2, discoveryTimeMs: 0, signalTimeMs: 1, quoteTimeMs: null,
+          simulationTimeMs: 1, exitSignalTimeMs: null, discoveryLatencyMs: 1, signalLatencyMs: 1, quoteLatencyMs: null, processingLatencyMs: 1,
+        }),
+      ).toThrow();
+      ledger.recordLatencySample('lat_ok', {
+        mint: 'MINT_A', observedAtMs: 3, discoveryTimeMs: 0, signalTimeMs: 1, quoteTimeMs: null,
+        simulationTimeMs: 1, exitSignalTimeMs: null, discoveryLatencyMs: 1, signalLatencyMs: 1, quoteLatencyMs: null, processingLatencyMs: 1,
+      });
+      expect(ledger.getRecentLatencySamples(0)).toHaveLength(2);
+    });
+
+    it('recordExit on a non-existent tradeId affects no rows and does not throw or corrupt subsequent calls', () => {
+      ledger.recordEntry(makeTrade({ tradeId: 'real_trade', mint: 'MINT_A' }));
+      expect(() =>
+        ledger.recordExit('does_not_exist', {
+          exitTimeMs: 2000, exitPriceSol: 1, exitReason: 'quick_tp', exitFeesSol: 0,
+          pnlSol: 0, pnlPct: 0, holdDurationMs: 0, maxFavorableExcursionPct: 0, maxAdverseExcursionPct: 0,
+        }),
+      ).not.toThrow();
+      // The real position is untouched, and the cached UPDATE statement still works correctly for it.
+      expect(ledger.getOpenPositions('V1')).toHaveLength(1);
+      ledger.recordExit('real_trade', {
+        exitTimeMs: 2000, exitPriceSol: 1.1, exitReason: 'quick_tp', exitFeesSol: 0,
+        pnlSol: 0.03, pnlPct: 10, holdDurationMs: 1000, maxFavorableExcursionPct: 10, maxAdverseExcursionPct: 0,
+      });
+      expect(ledger.getOpenPositions('V1')).toHaveLength(0);
+      expect(ledger.getAllClosedTrades('V1')[0]!.tradeId).toBe('real_trade');
+    });
+
+    it('throws when used after the underlying database is closed, exactly like a fresh prepare() would', () => {
+      const db = openLedger(':memory:');
+      const closingLedger = new ShadowLedger(db);
+      closingLedger.incrementCounter('probe', 1); // proves the cached statements work before close()
+      db.close();
+      expect(() => closingLedger.incrementCounter('probe', 1)).toThrow();
+      expect(() => closingLedger.getOpenPosition('V1', 'MINT_A')).toThrow();
+    });
+
+    it('a second ShadowLedger instance over a fresh DatabaseSync gets its own independently cached statements', () => {
+      // Guards against any accidental module-level/static statement sharing between instances.
+      const dbTwo = openLedger(':memory:');
+      const ledgerTwo = new ShadowLedger(dbTwo);
+      ledger.recordEntry(makeTrade({ tradeId: 'only_in_first', mint: 'MINT_A' }));
+      expect(ledger.getOpenPositions('V1')).toHaveLength(1);
+      expect(ledgerTwo.getOpenPositions('V1')).toHaveLength(0);
+      ledgerTwo.recordEntry(makeTrade({ tradeId: 'only_in_second', mint: 'MINT_A' }));
+      expect(ledger.getOpenPositions('V1').map((p) => p.tradeId)).toEqual(['only_in_first']);
+      expect(ledgerTwo.getOpenPositions('V1').map((p) => p.tradeId)).toEqual(['only_in_second']);
+    });
+  });
 });

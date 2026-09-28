@@ -1,4 +1,4 @@
-import type { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import type { OpenPositionSummary } from '../risk/types.js';
 import type { TokenTradeHistory } from '../types/trade.js';
 import type {
@@ -46,47 +46,132 @@ interface ShadowDailyRiskRow {
  * time) multiple shadow strategies share these tables concurrently and
  * must never see each other's open positions, daily risk, or trade
  * history (task 17: candidate/shadow isolation).
+ *
+ * Every statement on the hot per-tick path (called from ShadowRunner.onMarketTick() and its callees, once or more
+ * per live/shadow evaluation) is prepared ONCE, here in the constructor, and reused for the lifetime of this
+ * instance -- `node:sqlite`'s DatabaseSync.prepare() recompiles the statement from source text on every call, which
+ * measurably dominated per-call cost (see investigate/production-fetch-abandon's ShadowRunner cost breakdown:
+ * mean ~2.3ms per write with per-call prepare(), for statements whose own execution is trivial). This mirrors the
+ * pattern volume/tradeEventRecorder.ts already uses correctly. SQL text, parameter shapes, return values and error
+ * behavior are byte-identical to the prepare-per-call version; only WHEN each statement is compiled changes.
  */
 export class ShadowLedger {
-  constructor(private readonly db: DatabaseSync) {}
+  private readonly stmtInsertTrade: StatementSync;
+  private readonly stmtUpdateExit: StatementSync;
+  private readonly stmtSelectOpenPositions: StatementSync;
+  private readonly stmtSelectOpenPosition: StatementSync;
+  private readonly stmtSelectDailyRiskState: StatementSync;
+  private readonly stmtInsertDailyRiskState: StatementSync;
+  private readonly stmtApplyRealizedPnl: StatementSync;
+  private readonly stmtLatchCircuitBreaker: StatementSync;
+  private readonly stmtTokenHistorySummary: StatementSync;
+  private readonly stmtTokenHistoryLastClosed: StatementSync;
+  private readonly stmtTokenHistoryRecentClosed: StatementSync;
+  private readonly stmtInsertMissedSignal: StatementSync;
+  private readonly stmtInsertDataQualityEvent: StatementSync;
+  private readonly stmtInsertLatencySample: StatementSync;
+  private readonly stmtUpsertHealthCounter: StatementSync;
+
+  constructor(private readonly db: DatabaseSync) {
+    this.stmtInsertTrade = db.prepare(
+      `INSERT INTO shadow_trades (
+        trade_id, strategy_version, execution_mode, simulator_version, mint, reentry_index,
+        entry_time_ms, entry_price_sol, entry_size_sol, entry_filled_amount_sol, entry_fees_sol,
+        entry_score, expected_net_edge_pct, entry_liquidity_sol, entry_quote_json,
+        entry_token_amount_raw, entry_context_json, status, created_at_ms, updated_at_ms
+      ) VALUES (
+        @tradeId, @strategyVersion, @executionMode, @simulatorVersion, @mint, @reentryIndex,
+        @entryTimeMs, @entryPriceSol, @entrySizeSol, @entryFilledAmountSol, @entryFeesSol,
+        @entryScore, @expectedNetEdgePct, @entryLiquiditySol, @entryQuoteJson,
+        @entryTokenAmountRaw, @entryContextJson, 'open', @createdAtMs, @updatedAtMs
+      )`,
+    );
+    this.stmtUpdateExit = db.prepare(
+      `UPDATE shadow_trades SET
+        exit_time_ms = @exitTimeMs, exit_price_sol = @exitPriceSol, exit_reason = @exitReason,
+        exit_fees_sol = @exitFeesSol, pnl_sol = @pnlSol, pnl_pct = @pnlPct,
+        hold_duration_ms = @holdDurationMs, max_favorable_excursion_pct = @maxFavorableExcursionPct,
+        max_adverse_excursion_pct = @maxAdverseExcursionPct, exit_context_json = @exitContextJson, status = 'closed', updated_at_ms = @updatedAtMs
+      WHERE trade_id = @tradeId`,
+    );
+    this.stmtSelectOpenPositions = db.prepare(
+      `SELECT trade_id, mint, entry_size_sol FROM shadow_trades WHERE strategy_version = ? AND status = 'open'`,
+    );
+    this.stmtSelectOpenPosition = db.prepare(
+      `SELECT * FROM shadow_trades WHERE strategy_version = ? AND mint = ? AND status = 'open'`,
+    );
+    this.stmtSelectDailyRiskState = db.prepare(
+      `SELECT * FROM shadow_daily_risk_state WHERE strategy_version = ? AND trading_date_utc = ?`,
+    );
+    this.stmtInsertDailyRiskState = db.prepare(
+      `INSERT INTO shadow_daily_risk_state (strategy_version, trading_date_utc, starting_balance_sol, realized_pnl_sol, circuit_breaker_triggered)
+       VALUES (?, ?, ?, 0, 0)`,
+    );
+    this.stmtApplyRealizedPnl = db.prepare(
+      `UPDATE shadow_daily_risk_state SET realized_pnl_sol = realized_pnl_sol + ?
+       WHERE strategy_version = ? AND trading_date_utc = ?`,
+    );
+    this.stmtLatchCircuitBreaker = db.prepare(
+      `UPDATE shadow_daily_risk_state
+       SET circuit_breaker_triggered = 1, circuit_breaker_triggered_at_ms = COALESCE(circuit_breaker_triggered_at_ms, ?)
+       WHERE strategy_version = ? AND trading_date_utc = ?`,
+    );
+    this.stmtTokenHistorySummary = db.prepare(
+      `SELECT COUNT(*) as total_trades, SUM(COALESCE(pnl_sol, 0)) as cumulative_pnl_sol
+       FROM shadow_trades WHERE strategy_version = ? AND mint = ?`,
+    );
+    this.stmtTokenHistoryLastClosed = db.prepare(
+      `SELECT exit_time_ms, pnl_sol FROM shadow_trades WHERE strategy_version = ? AND mint = ? AND status = 'closed'
+       ORDER BY exit_time_ms DESC LIMIT 1`,
+    );
+    this.stmtTokenHistoryRecentClosed = db.prepare(
+      `SELECT pnl_sol FROM shadow_trades WHERE strategy_version = ? AND mint = ? AND status = 'closed'
+       ORDER BY exit_time_ms DESC LIMIT 20`,
+    );
+    this.stmtInsertMissedSignal = db.prepare(
+      `INSERT INTO shadow_missed_signals (id, strategy_version, mint, observed_at_ms, reason, detail)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    this.stmtInsertDataQualityEvent = db.prepare(
+      `INSERT INTO shadow_data_quality_events (id, strategy_version, mint, observed_at_ms, kind, severity, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    this.stmtInsertLatencySample = db.prepare(
+      `INSERT INTO shadow_latency_samples (
+        id, mint, observed_at_ms, discovery_time_ms, signal_time_ms, quote_time_ms, simulation_time_ms,
+        exit_signal_time_ms, discovery_latency_ms, signal_latency_ms, quote_latency_ms, processing_latency_ms,
+        detected_at_ms, market_data_time_ms, market_data_latency_ms, shadow_processing_latency_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    this.stmtUpsertHealthCounter = db.prepare(
+      `INSERT INTO shadow_health_counters (name, value, updated_at_ms) VALUES (?, ?, ?)
+       ON CONFLICT(name) DO UPDATE SET value = value + excluded.value, updated_at_ms = excluded.updated_at_ms`,
+    );
+  }
 
   recordEntry(trade: ShadowTradeRecord): void {
     const now = Date.now();
-    this.db
-      .prepare(
-        `INSERT INTO shadow_trades (
-          trade_id, strategy_version, execution_mode, simulator_version, mint, reentry_index,
-          entry_time_ms, entry_price_sol, entry_size_sol, entry_filled_amount_sol, entry_fees_sol,
-          entry_score, expected_net_edge_pct, entry_liquidity_sol, entry_quote_json,
-          entry_token_amount_raw, entry_context_json, status, created_at_ms, updated_at_ms
-        ) VALUES (
-          @tradeId, @strategyVersion, @executionMode, @simulatorVersion, @mint, @reentryIndex,
-          @entryTimeMs, @entryPriceSol, @entrySizeSol, @entryFilledAmountSol, @entryFeesSol,
-          @entryScore, @expectedNetEdgePct, @entryLiquiditySol, @entryQuoteJson,
-          @entryTokenAmountRaw, @entryContextJson, 'open', @createdAtMs, @updatedAtMs
-        )`,
-      )
-      .run({
-        tradeId: trade.tradeId,
-        strategyVersion: trade.strategyVersion,
-        executionMode: trade.executionMode,
-        simulatorVersion: trade.simulatorVersion,
-        mint: trade.mint,
-        reentryIndex: trade.reentryIndex,
-        entryTimeMs: trade.entryTimeMs,
-        entryPriceSol: trade.entryPriceSol,
-        entrySizeSol: trade.entrySizeSol,
-        entryFilledAmountSol: trade.entryFilledAmountSol,
-        entryFeesSol: trade.entryFeesSol,
-        entryScore: trade.entryScore,
-        expectedNetEdgePct: trade.expectedNetEdgePct,
-        entryLiquiditySol: trade.entryLiquiditySol,
-        entryQuoteJson: toJson(trade.entryQuote),
-        entryTokenAmountRaw: trade.entryTokenAmountRaw ?? null,
-        entryContextJson: toJson(trade.entryContext ?? null),
-        createdAtMs: now,
-        updatedAtMs: now,
-      });
+    this.stmtInsertTrade.run({
+      tradeId: trade.tradeId,
+      strategyVersion: trade.strategyVersion,
+      executionMode: trade.executionMode,
+      simulatorVersion: trade.simulatorVersion,
+      mint: trade.mint,
+      reentryIndex: trade.reentryIndex,
+      entryTimeMs: trade.entryTimeMs,
+      entryPriceSol: trade.entryPriceSol,
+      entrySizeSol: trade.entrySizeSol,
+      entryFilledAmountSol: trade.entryFilledAmountSol,
+      entryFeesSol: trade.entryFeesSol,
+      entryScore: trade.entryScore,
+      expectedNetEdgePct: trade.expectedNetEdgePct,
+      entryLiquiditySol: trade.entryLiquiditySol,
+      entryQuoteJson: toJson(trade.entryQuote),
+      entryTokenAmountRaw: trade.entryTokenAmountRaw ?? null,
+      entryContextJson: toJson(trade.entryContext ?? null),
+      createdAtMs: now,
+      updatedAtMs: now,
+    });
   }
 
   recordExit(
@@ -104,29 +189,16 @@ export class ShadowLedger {
       exitContext?: Record<string, unknown> | null;
     },
   ): void {
-    this.db
-      .prepare(
-        `UPDATE shadow_trades SET
-          exit_time_ms = @exitTimeMs, exit_price_sol = @exitPriceSol, exit_reason = @exitReason,
-          exit_fees_sol = @exitFeesSol, pnl_sol = @pnlSol, pnl_pct = @pnlPct,
-          hold_duration_ms = @holdDurationMs, max_favorable_excursion_pct = @maxFavorableExcursionPct,
-          max_adverse_excursion_pct = @maxAdverseExcursionPct, exit_context_json = @exitContextJson, status = 'closed', updated_at_ms = @updatedAtMs
-        WHERE trade_id = @tradeId`,
-      )
-      .run({ tradeId, updatedAtMs: Date.now(), ...withoutContext(exit), exitContextJson: toJson(exit.exitContext ?? null) });
+    this.stmtUpdateExit.run({ tradeId, updatedAtMs: Date.now(), ...withoutContext(exit), exitContextJson: toJson(exit.exitContext ?? null) });
   }
 
   getOpenPositions(strategyVersion: string): OpenPositionSummary[] {
-    const rows = this.db
-      .prepare(`SELECT trade_id, mint, entry_size_sol FROM shadow_trades WHERE strategy_version = ? AND status = 'open'`)
-      .all(strategyVersion) as unknown as ShadowTradeRow[];
+    const rows = this.stmtSelectOpenPositions.all(strategyVersion) as unknown as ShadowTradeRow[];
     return rows.map((row) => ({ tradeId: row.trade_id, mint: row.mint, entrySizeSol: row.entry_size_sol }));
   }
 
   getOpenPosition(strategyVersion: string, mint: string): ShadowTradeRecord | null {
-    const row = this.db
-      .prepare(`SELECT * FROM shadow_trades WHERE strategy_version = ? AND mint = ? AND status = 'open'`)
-      .get(strategyVersion, mint) as unknown as Record<string, unknown> | undefined;
+    const row = this.stmtSelectOpenPosition.get(strategyVersion, mint) as unknown as Record<string, unknown> | undefined;
     if (!row) return null;
     return hydrateShadowTradeRow(row);
   }
@@ -136,9 +208,7 @@ export class ShadowLedger {
     dateIsoUtc: string,
     startingBalanceSol: number,
   ): { startingBalanceSol: number; realizedPnlSol: number; circuitBreakerTriggered: boolean } {
-    const existing = this.db
-      .prepare(`SELECT * FROM shadow_daily_risk_state WHERE strategy_version = ? AND trading_date_utc = ?`)
-      .get(strategyVersion, dateIsoUtc) as unknown as ShadowDailyRiskRow | undefined;
+    const existing = this.stmtSelectDailyRiskState.get(strategyVersion, dateIsoUtc) as unknown as ShadowDailyRiskRow | undefined;
     if (existing) {
       return {
         startingBalanceSol: existing.starting_balance_sol,
@@ -146,55 +216,24 @@ export class ShadowLedger {
         circuitBreakerTriggered: existing.circuit_breaker_triggered === 1,
       };
     }
-    this.db
-      .prepare(
-        `INSERT INTO shadow_daily_risk_state (strategy_version, trading_date_utc, starting_balance_sol, realized_pnl_sol, circuit_breaker_triggered)
-         VALUES (?, ?, ?, 0, 0)`,
-      )
-      .run(strategyVersion, dateIsoUtc, startingBalanceSol);
+    this.stmtInsertDailyRiskState.run(strategyVersion, dateIsoUtc, startingBalanceSol);
     return { startingBalanceSol, realizedPnlSol: 0, circuitBreakerTriggered: false };
   }
 
   applyRealizedPnl(strategyVersion: string, dateIsoUtc: string, pnlSol: number): void {
-    this.db
-      .prepare(
-        `UPDATE shadow_daily_risk_state SET realized_pnl_sol = realized_pnl_sol + ?
-         WHERE strategy_version = ? AND trading_date_utc = ?`,
-      )
-      .run(pnlSol, strategyVersion, dateIsoUtc);
+    this.stmtApplyRealizedPnl.run(pnlSol, strategyVersion, dateIsoUtc);
   }
 
   latchCircuitBreaker(strategyVersion: string, dateIsoUtc: string, nowMs: number): void {
-    this.db
-      .prepare(
-        `UPDATE shadow_daily_risk_state
-         SET circuit_breaker_triggered = 1, circuit_breaker_triggered_at_ms = COALESCE(circuit_breaker_triggered_at_ms, ?)
-         WHERE strategy_version = ? AND trading_date_utc = ?`,
-      )
-      .run(nowMs, strategyVersion, dateIsoUtc);
+    this.stmtLatchCircuitBreaker.run(nowMs, strategyVersion, dateIsoUtc);
   }
 
   getTokenTradeHistory(strategyVersion: string, mint: string): TokenTradeHistory {
-    const summary = this.db
-      .prepare(
-        `SELECT COUNT(*) as total_trades, SUM(COALESCE(pnl_sol, 0)) as cumulative_pnl_sol
-         FROM shadow_trades WHERE strategy_version = ? AND mint = ?`,
-      )
-      .get(strategyVersion, mint) as unknown as { total_trades: number; cumulative_pnl_sol: number | null };
+    const summary = this.stmtTokenHistorySummary.get(strategyVersion, mint) as unknown as { total_trades: number; cumulative_pnl_sol: number | null };
 
-    const lastClosed = this.db
-      .prepare(
-        `SELECT exit_time_ms, pnl_sol FROM shadow_trades WHERE strategy_version = ? AND mint = ? AND status = 'closed'
-         ORDER BY exit_time_ms DESC LIMIT 1`,
-      )
-      .get(strategyVersion, mint) as unknown as { exit_time_ms: number | null; pnl_sol: number | null } | undefined;
+    const lastClosed = this.stmtTokenHistoryLastClosed.get(strategyVersion, mint) as unknown as { exit_time_ms: number | null; pnl_sol: number | null } | undefined;
 
-    const recentClosed = this.db
-      .prepare(
-        `SELECT pnl_sol FROM shadow_trades WHERE strategy_version = ? AND mint = ? AND status = 'closed'
-         ORDER BY exit_time_ms DESC LIMIT 20`,
-      )
-      .all(strategyVersion, mint) as unknown as { pnl_sol: number | null }[];
+    const recentClosed = this.stmtTokenHistoryRecentClosed.all(strategyVersion, mint) as unknown as { pnl_sol: number | null }[];
 
     let consecutiveLosses = 0;
     for (const row of recentClosed) {
@@ -213,60 +252,37 @@ export class ShadowLedger {
   }
 
   recordMissedSignal(id: string, signal: MissedSignalRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_missed_signals (id, strategy_version, mint, observed_at_ms, reason, detail)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, signal.strategyVersion, signal.mint, signal.observedAtMs, signal.reason, signal.detail);
+    this.stmtInsertMissedSignal.run(id, signal.strategyVersion, signal.mint, signal.observedAtMs, signal.reason, signal.detail);
   }
 
   recordDataQualityEvent(id: string, event: DataQualityEventRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_data_quality_events (id, strategy_version, mint, observed_at_ms, kind, severity, detail)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, event.strategyVersion, event.mint, event.observedAtMs, event.kind, event.severity, event.detail);
+    this.stmtInsertDataQualityEvent.run(id, event.strategyVersion, event.mint, event.observedAtMs, event.kind, event.severity, event.detail);
   }
 
   recordLatencySample(id: string, sample: LatencySampleRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_latency_samples (
-          id, mint, observed_at_ms, discovery_time_ms, signal_time_ms, quote_time_ms, simulation_time_ms,
-          exit_signal_time_ms, discovery_latency_ms, signal_latency_ms, quote_latency_ms, processing_latency_ms,
-          detected_at_ms, market_data_time_ms, market_data_latency_ms, shadow_processing_latency_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        sample.mint,
-        sample.observedAtMs,
-        sample.discoveryTimeMs,
-        sample.signalTimeMs,
-        sample.quoteTimeMs,
-        sample.simulationTimeMs,
-        sample.exitSignalTimeMs,
-        sample.discoveryLatencyMs,
-        sample.signalLatencyMs,
-        sample.quoteLatencyMs,
-        sample.processingLatencyMs,
-        sample.detectedAtMs ?? null,
-        sample.marketDataTimeMs ?? null,
-        sample.marketDataLatencyMs ?? null,
-        sample.shadowProcessingLatencyMs ?? null,
-      );
+    this.stmtInsertLatencySample.run(
+      id,
+      sample.mint,
+      sample.observedAtMs,
+      sample.discoveryTimeMs,
+      sample.signalTimeMs,
+      sample.quoteTimeMs,
+      sample.simulationTimeMs,
+      sample.exitSignalTimeMs,
+      sample.discoveryLatencyMs,
+      sample.signalLatencyMs,
+      sample.quoteLatencyMs,
+      sample.processingLatencyMs,
+      sample.detectedAtMs ?? null,
+      sample.marketDataTimeMs ?? null,
+      sample.marketDataLatencyMs ?? null,
+      sample.shadowProcessingLatencyMs ?? null,
+    );
   }
 
   /** Persisted health/tick counters (upsert-increment) so the status CLI can read what the engine process counted. */
   incrementCounter(name: string, by = 1): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_health_counters (name, value, updated_at_ms) VALUES (?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET value = value + excluded.value, updated_at_ms = excluded.updated_at_ms`,
-      )
-      .run(name, by, Date.now());
+    this.stmtUpsertHealthCounter.run(name, by, Date.now());
   }
 
   getCounters(): Record<string, number> {
