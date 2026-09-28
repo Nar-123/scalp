@@ -30,6 +30,7 @@ describe('buildShadowStatusReport', () => {
     runner.onMarketTick(entryEligibleTick({ observedAtMs: 72_000 })); // cooldown -> missed signal
     runner.onMarketTick(entryEligibleTick({ observedAtMs: 72_000 })); // duplicate -> data quality event
 
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: the 4 observability writes are now buffered
     const report = buildShadowStatusReport(ledger, ['V1'], utcDateString, 100_000, new HealthCounters(), 10_000_000_000_000, 10_000_000_000_000);
     const v1 = report.strategies[0]!;
     expect(v1.closedTrades).toBe(1);

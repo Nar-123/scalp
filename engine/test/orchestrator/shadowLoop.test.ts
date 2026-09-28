@@ -82,6 +82,9 @@ async function start(opts: {
     },
   };
   const activation = createShadowActivation(cfg, db, logger);
+  // investigate/production-fetch-abandon Phase 2: recordMissedSignal/recordDataQualityEvent/recordLatencySample/
+  // incrementCounter are now buffered and flushed periodically -- mirrors the ledger.start() call index.ts makes.
+  activation?.ledger.start();
 
   const stop = await startOrchestrator(cfg, {
     discoverySources: [source],
@@ -124,6 +127,9 @@ const count = (db: ReturnType<typeof openLedger>, table: string) => (db.prepare(
 let running: Harness | null = null;
 afterEach(async () => {
   await running?.stop();
+  // investigate/production-fetch-abandon Phase 2: mirrors index.ts's stop_shadow_observability shutdown step --
+  // flushes any buffered writes and clears the periodic timer so it doesn't outlive the test.
+  running?.activation?.ledger.stop();
   running = null;
   vi.restoreAllMocks();
 });

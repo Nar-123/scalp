@@ -65,6 +65,7 @@ describe('malformed / impossible data never becomes a trade signal', () => {
     const outcomes = runner.onMarketTick(entryEligibleTick(overrides));
     expect(outcomes[0]!.kind).toBe('skipped_data_quality');
     expect(ledger.getOpenPositions('V1')).toHaveLength(0);
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordDataQualityEvent is now buffered
     expect(ledger.getRecentDataQualityEvents(0).some((e) => e.severity === 'reject')).toBe(true);
   });
 
@@ -93,6 +94,7 @@ describe('malformed / impossible data never becomes a trade signal', () => {
     const snap = health.snapshot().counters;
     expect(snap.shadow_ticks_received).toBe(4);
     expect(snap.shadow_ticks_rejected_data_quality).toBe(2);
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordDataQualityEvent is now buffered
     const severities = ledger.getRecentDataQualityEvents(0).map((e) => `${e.kind}:${e.severity}`);
     expect(severities).toContain('stale_market_data:warning');
     expect(severities).toContain('duplicate_event:block');
@@ -103,6 +105,7 @@ describe('malformed / impossible data never becomes a trade signal', () => {
     const ledger = new ShadowLedger(openLedger(':memory:'));
     const runner = new ShadowRunner({ ledger, strategies: [V1], assumptions: DEFAULT_ASSUMPTIONS });
     for (const t of [40_000, 90_000, 400_000]) runner.onMarketTick(entryEligibleTick({ observedAtMs: t, liquiditySol: 5 }));
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordDataQualityEvent is now buffered
     expect(ledger.getRecentDataQualityEvents(0).some((e) => e.kind === 'missing_event')).toBe(false);
   });
 });
@@ -125,6 +128,9 @@ describe('restart recovery against a real ledger file', () => {
       }
       expect(ledger.getOpenPositions('V1')).toHaveLength(1); // MINT_A still open
       expect(ledger.getOrInitDailyRiskState('V1', '1970-01-01', 10).circuitBreakerTriggered).toBe(true);
+      // investigate/production-fetch-abandon Phase 2: flushes buffered observability writes (including counters)
+      // before closing the DB -- exactly the clean-shutdown step index.ts's own shutdown sequence performs.
+      ledger.stop();
       db.close();
 
       // --- process 2 (restart): brand-new objects over the same file ---
@@ -154,6 +160,7 @@ describe('restart recovery against a real ledger file', () => {
       expect(ledger.getOrInitDailyRiskState('V2', '1970-01-01', 10).circuitBreakerTriggered).toBe(false);
 
       // counters persisted across the restart and kept accumulating
+      ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: incrementCounter is now buffered
       expect(ledger.getCounters().shadow_ticks_received).toBeGreaterThan(before);
 
       // production tables untouched throughout
