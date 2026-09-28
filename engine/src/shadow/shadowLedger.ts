@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { OpenPositionSummary } from '../risk/types.js';
 import type { TokenTradeHistory } from '../types/trade.js';
+import { ShadowObservabilityRecorder, type ShadowObservabilityRecorderOptions } from './shadowObservabilityRecorder.js';
 import type {
   DataQualityEventRecord,
   LatencySampleRecord,
@@ -46,9 +47,40 @@ interface ShadowDailyRiskRow {
  * time) multiple shadow strategies share these tables concurrently and
  * must never see each other's open positions, daily risk, or trade
  * history (task 17: candidate/shadow isolation).
+ *
+ * investigate/production-fetch-abandon Phase 2: recordMissedSignal, recordDataQualityEvent, recordLatencySample and
+ * incrementCounter are pure observations no trading decision ever reads back (see each method's own doc comment
+ * below), so they are buffered and flushed in batches by an owned ShadowObservabilityRecorder instead of writing
+ * synchronously on every call -- call start()/stop() around this ledger's lifetime (mirroring
+ * volume/pumpfunVolumeService.ts's start()/stop() for its own TradeEventRecorder) so the buffer is actually
+ * flushed periodically and on clean shutdown. Every other method (trade state, positions, risk, evaluation-scoped
+ * reads) is unchanged: still synchronous, still immediately visible.
  */
 export class ShadowLedger {
-  constructor(private readonly db: DatabaseSync) {}
+  private readonly observability: ShadowObservabilityRecorder;
+
+  constructor(
+    private readonly db: DatabaseSync,
+    observabilityOptions?: ShadowObservabilityRecorderOptions,
+  ) {
+    this.observability = new ShadowObservabilityRecorder(db, observabilityOptions);
+  }
+
+  /** Starts the periodic (~1/s) observability flush timer. No-op if already started. */
+  start(): void {
+    this.observability.start();
+  }
+
+  /** Stops the periodic flush timer and flushes whatever is still buffered, synchronously, before returning. */
+  stop(): void {
+    this.observability.stop();
+  }
+
+  /** Forces an immediate flush of buffered observability writes (used by tests and available for an on-demand
+   * CLI refresh); returns rows written. Never needed on the live trading path. */
+  flushObservability(): number {
+    return this.observability.flush();
+  }
 
   recordEntry(trade: ShadowTradeRecord): void {
     const now = Date.now();
@@ -212,61 +244,33 @@ export class ShadowLedger {
     };
   }
 
+  /** Pure observation: never read back by any entry/exit/risk decision (only by getRecentMissedSignals(), used
+   * solely by the offline `shadow status` CLI). Buffered and batch-flushed by ShadowObservabilityRecorder -- see
+   * this class's own doc comment. */
   recordMissedSignal(id: string, signal: MissedSignalRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_missed_signals (id, strategy_version, mint, observed_at_ms, reason, detail)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, signal.strategyVersion, signal.mint, signal.observedAtMs, signal.reason, signal.detail);
+    this.observability.recordMissedSignal(id, signal);
   }
 
+  /** Pure observation: never read back by any entry/exit/risk decision (only by getRecentDataQualityEvents(), used
+   * solely by the offline `shadow status` CLI). Buffered and batch-flushed by ShadowObservabilityRecorder -- see
+   * this class's own doc comment. */
   recordDataQualityEvent(id: string, event: DataQualityEventRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_data_quality_events (id, strategy_version, mint, observed_at_ms, kind, severity, detail)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, event.strategyVersion, event.mint, event.observedAtMs, event.kind, event.severity, event.detail);
+    this.observability.recordDataQualityEvent(id, event);
   }
 
+  /** Pure observation: never read back by any entry/exit/risk decision (only by getRecentLatencySamples(), used
+   * solely by the offline `shadow status` CLI). Buffered and batch-flushed by ShadowObservabilityRecorder -- see
+   * this class's own doc comment. */
   recordLatencySample(id: string, sample: LatencySampleRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_latency_samples (
-          id, mint, observed_at_ms, discovery_time_ms, signal_time_ms, quote_time_ms, simulation_time_ms,
-          exit_signal_time_ms, discovery_latency_ms, signal_latency_ms, quote_latency_ms, processing_latency_ms,
-          detected_at_ms, market_data_time_ms, market_data_latency_ms, shadow_processing_latency_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        sample.mint,
-        sample.observedAtMs,
-        sample.discoveryTimeMs,
-        sample.signalTimeMs,
-        sample.quoteTimeMs,
-        sample.simulationTimeMs,
-        sample.exitSignalTimeMs,
-        sample.discoveryLatencyMs,
-        sample.signalLatencyMs,
-        sample.quoteLatencyMs,
-        sample.processingLatencyMs,
-        sample.detectedAtMs ?? null,
-        sample.marketDataTimeMs ?? null,
-        sample.marketDataLatencyMs ?? null,
-        sample.shadowProcessingLatencyMs ?? null,
-      );
+    this.observability.recordLatencySample(id, sample);
   }
 
-  /** Persisted health/tick counters (upsert-increment) so the status CLI can read what the engine process counted. */
+  /** Persisted health/tick counters so the status CLI can read what the engine process counted. Pure observation:
+   * HealthCounters (shadowStatus.ts) keeps its own authoritative in-memory total for every in-process reader and
+   * never reads this sink back, so increments are coalesced (summed per name) and batch-flushed by
+   * ShadowObservabilityRecorder -- see this class's own doc comment. */
   incrementCounter(name: string, by = 1): void {
-    this.db
-      .prepare(
-        `INSERT INTO shadow_health_counters (name, value, updated_at_ms) VALUES (?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET value = value + excluded.value, updated_at_ms = excluded.updated_at_ms`,
-      )
-      .run(name, by, Date.now());
+    this.observability.incrementCounter(name, by);
   }
 
   getCounters(): Record<string, number> {

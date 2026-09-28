@@ -59,6 +59,7 @@ describe('ShadowRunner: basic entry/exit', () => {
     const { ledger, runner } = makeRunner([V1]);
     const outcomes = runner.onMarketTick(entryEligibleTick({ priceSol: null }));
     expect(outcomes[0]!.kind).toBe('missed_signal');
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordMissedSignal is now buffered
     expect(ledger.getRecentMissedSignals('V1', 0)[0]!.reason).toBe('missing_market_data');
   });
 
@@ -77,6 +78,7 @@ describe('ShadowRunner: re-entry replay', () => {
 
     const duringCooldown = runner.onMarketTick(entryEligibleTick({ observedAtMs: 72_000 })); // 30s after exit, cooldown is 60s
     expect(duringCooldown[0]!.kind).toBe('missed_signal');
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordMissedSignal is now buffered
     expect(ledger.getRecentMissedSignals('V1', 0).some((m) => m.reason === 'reentry_cooldown_active')).toBe(true);
 
     const afterCooldown = runner.onMarketTick(entryEligibleTick({ observedAtMs: 102_001 })); // 60_001ms after exit
@@ -123,6 +125,7 @@ describe('ShadowRunner: risk-limit replay', () => {
     }
     const outcome = runner.onMarketTick(entryEligibleTick({ mint: 'MINT_6', observedAtMs: 90_000 }));
     expect(outcome[0]!.kind).toBe('missed_signal');
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordMissedSignal is now buffered
     expect(ledger.getRecentMissedSignals('V1', 0).some((m) => m.reason === 'daily_loss_circuit_breaker_triggered')).toBe(true);
   });
 
@@ -205,6 +208,7 @@ describe('ShadowRunner: data quality gating', () => {
     // both positions opened on the first tick remain open, untouched.
     expect(ledger.getOpenPositions('V1')).toHaveLength(1);
     expect(ledger.getOpenPositions('V2')).toHaveLength(1);
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordDataQualityEvent is now buffered
     const dqEvents = ledger.getRecentDataQualityEvents(0).filter((e) => e.kind === 'duplicate_event');
     expect(dqEvents).toHaveLength(1); // recorded once per tick, not once per strategy
   });
@@ -214,6 +218,7 @@ describe('ShadowRunner: data quality gating', () => {
     runner.onMarketTick(entryEligibleTick({ observedAtMs: 40_000 }));
     const outcomes = runner.onMarketTick(winningExitTick(40_000 + 20_000)); // a large, "stale" gap, but still forward-moving and unique
     expect(outcomes[0]!.kind).toBe('exited'); // the exit still processed despite the staleness
+    ledger.flushObservability(); // investigate/production-fetch-abandon Phase 2: recordDataQualityEvent is now buffered
     expect(ledger.getRecentDataQualityEvents(0).some((e) => e.kind === 'stale_market_data')).toBe(true);
   });
 });

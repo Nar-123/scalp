@@ -72,6 +72,9 @@ async function main(): Promise<void> {
   );
   // null unless SHADOW_TRADING_ENABLED=true. The price-path recorder observes the native in-memory cache only.
   const shadow = createShadowActivation(cfg, db, logger, nativeMarket ? new NativePathObserver(nativeMarket) : undefined);
+  // investigate/production-fetch-abandon Phase 2: starts the shadow ledger's periodic (~1/s) observability flush
+  // timer (recordMissedSignal/recordDataQualityEvent/recordLatencySample/incrementCounter) -- see shadowLedger.ts.
+  shadow?.ledger.start();
   volumeService?.attachConnectionHooks(connection);
   volumeService?.start();
 
@@ -126,6 +129,9 @@ async function main(): Promise<void> {
         { name: 'abort_provider_requests', run: () => providers.shutdown() },
         { name: 'stop_price_paths', run: () => shadow?.pathRecorder?.stop() },
         { name: 'stop_volume_service', run: () => volumeService?.stop() },
+        // investigate/production-fetch-abandon Phase 2: flushes any still-buffered observability writes before the
+        // ledger DB is closed below -- must run after stop_orchestrator (no more ticks) and before close_ledger.
+        { name: 'stop_shadow_observability', run: () => shadow?.ledger.stop() },
         { name: 'flush_provider_metrics', run: () => metricsRecorder.stop() },
         { name: 'close_ledger', run: () => db.close() },
       ],

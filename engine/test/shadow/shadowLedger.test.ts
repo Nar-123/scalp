@@ -95,14 +95,20 @@ describe('ShadowLedger', () => {
   });
 
   it('records and retrieves missed signals scoped by strategy version', () => {
+    // investigate/production-fetch-abandon Phase 2: recordMissedSignal is now buffered (batch-flushed roughly
+    // once per second, or on demand via flushObservability()) rather than written synchronously -- see
+    // shadowLedger.ts / shadowObservabilityRecorder.ts. The DECISION-relevant methods (recordEntry, getOpenPosition,
+    // etc.) remain fully synchronous, unaffected, and covered elsewhere in this file.
     ledger.recordMissedSignal('m1', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1000, reason: 'reentry_cooldown_active', detail: 'x' });
     ledger.recordMissedSignal('m2', { mint: 'MINT_A', strategyVersion: 'V2', observedAtMs: 1000, reason: 'reentry_cooldown_active', detail: 'x' });
+    ledger.flushObservability();
     expect(ledger.getRecentMissedSignals('V1', 0)).toHaveLength(1);
     expect(ledger.getRecentMissedSignals('V2', 0)).toHaveLength(1);
   });
 
   it('records and retrieves data quality events', () => {
     ledger.recordDataQualityEvent('dq1', { mint: 'MINT_A', strategyVersion: null, observedAtMs: 1000, kind: 'stale_market_data', severity: 'warning', detail: 'x' });
+    ledger.flushObservability();
     const events = ledger.getRecentDataQualityEvents(0);
     expect(events).toHaveLength(1);
     expect(events[0]!.kind).toBe('stale_market_data');
@@ -119,6 +125,7 @@ describe('ShadowLedger', () => {
       simulationTimeMs: 600, exitSignalTimeMs: null, discoveryLatencyMs: null, marketDataLatencyMs: null,
       quoteLatencyMs: null, signalLatencyMs: 100, processingLatencyMs: 100, shadowProcessingLatencyMs: 2,
     });
+    ledger.flushObservability();
     const samples = ledger.getRecentLatencySamples(0);
     expect(samples).toHaveLength(2);
     expect(samples.find((s) => s.discoveryLatencyMs === null)?.shadowProcessingLatencyMs).toBe(2);
@@ -131,5 +138,39 @@ describe('ShadowLedger', () => {
     }));
     const open = ledger.getOpenPosition('V1', 'MINT_A');
     expect(open?.entryQuote).toEqual({ quotedPriceSol: 1.001, quoteTimestampMs: 999, route: 'raydium', expectedOutputSol: 0.3, estimatedPriceImpactPct: 0.2, estimatedSlippagePct: 0.3 });
+  });
+
+  // investigate/production-fetch-abandon Phase 2: recordEntry/recordExit/getOpenPosition/risk-state methods above
+  // are all unaffected by the observability batching -- these tests cover ShadowLedger's own start()/stop()
+  // delegation to its owned ShadowObservabilityRecorder.
+  describe('observability batching lifecycle', () => {
+    it('start()/stop() delegate to the owned recorder: stop() flushes whatever is buffered', () => {
+      ledger.recordMissedSignal('m1', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1000, reason: 'reentry_cooldown_active', detail: 'x' });
+      expect(ledger.getRecentMissedSignals('V1', 0)).toHaveLength(0); // not yet flushed
+      ledger.start();
+      ledger.stop();
+      expect(ledger.getRecentMissedSignals('V1', 0)).toHaveLength(1); // flushed by stop()
+    });
+
+    it('decision-critical methods (recordEntry, getOpenPosition) stay synchronous and unaffected by unflushed observability writes', () => {
+      // Interleave a buffered (not yet flushed) observability write with a real trading decision, proving the
+      // decision path never depends on -- or is delayed by -- flush completion.
+      ledger.recordDataQualityEvent('dq1', { mint: 'MINT_A', strategyVersion: 'V1', observedAtMs: 1000, kind: 'stale_market_data', severity: 'warning', detail: 'unflushed' });
+      ledger.recordEntry(makeTrade({ tradeId: 'real_trade', mint: 'MINT_A' }));
+      expect(ledger.getOpenPositions('V1')).toEqual([{ tradeId: 'real_trade', mint: 'MINT_A', entrySizeSol: 0.3 }]);
+      expect(ledger.getOpenPosition('V1', 'MINT_A')?.tradeId).toBe('real_trade');
+      // the observability write is still sitting unflushed -- proves it truly never touched the decision path above
+      expect(ledger.getRecentDataQualityEvents(0)).toHaveLength(0);
+      ledger.flushObservability();
+      expect(ledger.getRecentDataQualityEvents(0)).toHaveLength(1);
+    });
+
+    it('flushObservability() forces an immediate flush without needing start()', () => {
+      ledger.incrementCounter('shadow_ticks_received', 3);
+      ledger.incrementCounter('shadow_ticks_received', 2);
+      const written = ledger.flushObservability();
+      expect(written).toBe(1); // coalesced into one upsert
+      expect(ledger.getCounters()).toEqual({ shadow_ticks_received: 5 });
+    });
   });
 });
