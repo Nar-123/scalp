@@ -21,6 +21,22 @@ import type { ProviderKind, ProviderMetrics } from './providerMetrics.js';
 
 export type ProviderFailureReason = 'rate_limited' | 'timeout' | 'unavailable' | 'unsupported' | 'shutdown' | 'circuit_open' | 'deadline_exceeded';
 
+/**
+ * P3 fix (`investigate/first-hung-evaluation`): fixed, additional grace period, on top of the normal
+ * `effectiveTimeoutMs` window, before an attempt is forcibly abandoned regardless of what `fetchImpl` does. See
+ * `HardAbandonSentinel` below for why this exists. Deliberately NOT configurable (no new tuning surface, no config
+ * schema change): it is a pure safety net, not a normal timeout knob, and every existing `timeoutMs`/`maxTotalMs`
+ * value keeps its exact existing meaning for any `fetchImpl` that honors its `AbortSignal` -- which covers every
+ * real fetch implementation this codebase uses today.
+ */
+const HARD_ABANDON_GRACE_MS = 2000;
+
+/**
+ * Internal marker thrown when an attempt is forcibly abandoned by the secondary hard boundary (see
+ * `HARD_ABANDON_GRACE_MS`) -- never constructed by, or exposed to, any caller of `ProviderGate`.
+ */
+class HardAbandonSentinel extends Error {}
+
 export class ProviderError extends Error {
   constructor(
     readonly providerKind: ProviderKind,
@@ -341,27 +357,51 @@ export class ProviderGate {
       }, effectiveTimeoutMs);
       const onShutdown = (): void => attemptController.abort();
       signal.addEventListener('abort', onShutdown, { once: true });
+      // P3 fix: `attemptController.abort()` above only ASKS `fetchImpl` to stop -- it cannot force a
+      // non-cooperating implementation (one that never observes its `AbortSignal`) to actually settle. Without an
+      // independent, secondary boundary, `await this.fetchImpl(...)` below -- and with it this endpoint's
+      // concurrency slot, the caller's `PriorityAdmissionGate` ticket, and its `EvaluationScheduler` slot -- would
+      // stay pending FOREVER (confirmed by direct reproduction on `investigate/first-hung-evaluation`). This timer
+      // fires `HARD_ABANDON_GRACE_MS` after the normal abort timer already did, regardless of what the real fetch
+      // call ever does, and forces this attempt to a conclusion. The abandoned fetch is deliberately NOT cancelled
+      // a second time and its eventual settlement (if any) is deliberately never awaited again -- see `attemptWork`
+      // below for how that is done without an unhandled rejection or a double release.
+      let rejectHardAbandon: ((err: HardAbandonSentinel) => void) | undefined;
+      const hardAbandon = new Promise<never>((_resolve, reject) => {
+        rejectHardAbandon = reject;
+      });
+      const hardAbandonTimer = setTimeout(() => rejectHardAbandon?.(new HardAbandonSentinel('fetchImpl did not settle even after its AbortSignal fired')), effectiveTimeoutMs + HARD_ABANDON_GRACE_MS);
       try {
         const url = req.path !== undefined ? st.endpoint.baseUrl.replace(/\/+$/, '') + req.path : st.endpoint.baseUrl;
-        const res = await this.fetchImpl(url, {
-          method: req.method,
-          headers: { ...(st.endpoint.headers ?? {}), ...(req.headers ?? {}) },
-          ...(req.body !== undefined ? { body: req.body } : {}),
-          signal: attemptController.signal,
-        });
-        const body = await res.text();
+        // Fetch AND body read are both covered by the hard boundary (a `fetchImpl` could resolve headers promptly
+        // but stall forever reading the body). `attemptWork` is given its own `.catch()` immediately, unconditionally,
+        // so that if `hardAbandon` wins the race below, `attemptWork`'s eventual settlement -- whenever it happens,
+        // if ever -- is silently swallowed instead of becoming an unhandled rejection; it is never awaited again
+        // after this point, and nothing here re-reads `st.active` or metrics from it.
+        const attemptWork = (async (): Promise<{ status: number; headers: { get(name: string): string | null; forEach?(cb: (value: string, key: string) => void): void }; body: string }> => {
+          const res = await this.fetchImpl(url, {
+            method: req.method,
+            headers: { ...(st.endpoint.headers ?? {}), ...(req.headers ?? {}) },
+            ...(req.body !== undefined ? { body: req.body } : {}),
+            signal: attemptController.signal,
+          });
+          const body = await res.text();
+          return { status: res.status, headers: res.headers, body };
+        })();
+        attemptWork.catch(() => undefined);
+        const { status, headers: rawHeaders, body } = await Promise.race([attemptWork, hardAbandon]);
         const headers: Record<string, string> = {};
-        res.headers.forEach?.((v, k) => {
+        rawHeaders.forEach?.((v, k) => {
           headers[k.toLowerCase()] = v;
         });
         const asOfMs = this.now();
         this.metrics.recordLatency(kind, asOfMs - t0);
-        if (res.status >= 200 && res.status < 300) {
+        if (status >= 200 && status < 300) {
           this.metrics.inc(kind, 'successes');
           this.metrics.endpointInc(st.host, 'successes');
-          response = { status: res.status, headers, body, host: st.host, asOfMs };
+          response = { status, headers, body, host: st.host, asOfMs };
           outcome = 'ok';
-        } else if (res.status === 429) {
+        } else if (status === 429) {
           this.metrics.inc(kind, 'http429');
           this.metrics.inc(kind, 'failures');
           this.metrics.endpointInc(st.host, 'http429');
@@ -376,13 +416,13 @@ export class ProviderGate {
             delayMs = parseRetryAfterMs(headers['retry-after'] ?? null, asOfMs) ?? this.backoff(attempt);
             outcome = 'retry';
           }
-        } else if (res.status === 403 && req.rpcMethod) {
+        } else if (status === 403 && req.rpcMethod) {
           st.unsupportedUntil.set(req.rpcMethod, this.now() + this.o.unsupportedCooldownMs);
           this.metrics.inc(kind, 'unsupported');
           this.metrics.inc(kind, 'failures');
           this.metrics.endpointInc(st.host, 'failures');
           outcome = 'giveup';
-        } else if (res.status >= 500) {
+        } else if (status >= 500) {
           this.metrics.inc(kind, 'http5xx');
           this.metrics.inc(kind, 'failures');
           this.metrics.endpointInc(st.host, 'failures');
@@ -392,11 +432,32 @@ export class ProviderGate {
           // Other 4xx (bad request, no route, ...): the provider ANSWERED; the caller interprets it. Not a provider failure.
           this.metrics.inc(kind, 'successes');
           this.metrics.endpointInc(st.host, 'successes');
-          response = { status: res.status, headers, body, host: st.host, asOfMs };
+          response = { status, headers, body, host: st.host, asOfMs };
           outcome = 'ok';
         }
-      } catch {
-        if (signal.aborted) {
+      } catch (err) {
+        if (err instanceof HardAbandonSentinel) {
+          // The secondary hard boundary fired: `fetchImpl` never settled even after its AbortSignal was raised.
+          // Reuse the EXACT SAME classification a genuine, cooperating timeout would already get (see the
+          // `timedOut` branches immediately below) -- `timedOut` is always true by construction here, since the
+          // normal abort timer (shorter than this one) always fires first. This is deliberately NOT a new failure
+          // category from the circuit breaker's point of view: whether the true cause is the remote provider or our
+          // own runtime not honoring an abort is indeterminate, so it is judged exactly as a fair, non-truncated
+          // timeout already is. `fetchAbandoned` is incremented purely as an operational signal: it should be ~0 in
+          // healthy operation, and a nonzero rate is itself worth alerting on regardless of which endpoint it hits.
+          this.metrics.inc(kind, 'fetchAbandoned');
+          if (budgetTruncated) {
+            outcome = 'local_deadline';
+          } else {
+            this.metrics.inc(kind, 'failures');
+            this.metrics.endpointInc(st.host, 'failures');
+            this.metrics.inc(kind, 'timeouts');
+            this.metrics.endpointInc(st.host, 'timeouts');
+            seen.timeout = true;
+            delayMs = this.backoff(attempt);
+            outcome = 'retry';
+          }
+        } else if (signal.aborted) {
           this.metrics.inc(kind, 'failures');
           this.metrics.endpointInc(st.host, 'failures');
           outcome = 'giveup';
@@ -425,6 +486,7 @@ export class ProviderGate {
         }
       } finally {
         clearTimeout(timer);
+        clearTimeout(hardAbandonTimer);
         signal.removeEventListener('abort', onShutdown);
         this.release(st);
       }

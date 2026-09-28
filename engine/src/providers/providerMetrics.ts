@@ -33,6 +33,15 @@ export interface KindCounters {
   cacheHits: number;
   cacheMisses: number;
   dedupHits: number;
+  /**
+   * P3 fix (`investigate/first-hung-evaluation`): counts every attempt where `fetchImpl` did not settle even after
+   * its `AbortSignal` was raised, forcing the gate's secondary hard boundary to abandon it (see `HARD_ABANDON_GRACE_MS`
+   * in providerGate.ts). Judged exactly like a fair, non-truncated timeout for the circuit breaker/retry logic --
+   * this counter exists purely as an operational signal. It should be ~0 in healthy operation; a nonzero rate means
+   * the fetch layer or runtime is not honoring cancellation and is worth investigating regardless of which endpoint
+   * it hits.
+   */
+  fetchAbandoned: number;
 }
 
 const zero = (): KindCounters => ({
@@ -55,6 +64,7 @@ const zero = (): KindCounters => ({
   cacheHits: 0,
   cacheMisses: 0,
   dedupHits: 0,
+  fetchAbandoned: 0,
 });
 
 class Reservoir {
