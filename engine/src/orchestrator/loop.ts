@@ -113,6 +113,12 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
   // gate more simultaneous RPC demand than it can service without queueing -- no evaluation ever needs to wait in
   // ProviderGate's own waiter queue for a slot. Never below 1.
   const scheduler = new EvaluationScheduler({ maxConcurrent: Math.max(1, cfg.providers.rpc.maxConcurrent) });
+  // P1 observability: slots held / waiting on a provider / pending ticks, with high-water marks, once per metrics interval.
+  const schedulerStatsTimer =
+    cfg.providers.metricsLogIntervalMs > 0
+      ? setInterval(() => deps.logger.info({ scheduler: scheduler.stats() }, 'evaluation scheduler'), cfg.providers.metricsLogIntervalMs)
+      : null;
+  schedulerStatsTimer?.unref?.();
 
   const positionMonitor = new PositionMonitor(
     { executor: deps.executor, priceSource: deps.priceSource, aggregator: deps.aggregator, ledger: deps.ledger, emergencyStop, logger: deps.logger },
@@ -760,6 +766,7 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
     for (const mint of [...watched.keys()]) {
       stopWatching(mint);
     }
+    if (schedulerStatsTimer) clearInterval(schedulerStatsTimer);
     scheduler.stop(); // refuses any further dispatch; already-active evaluations are left to finish (bounded by their own timeouts)
     positionMonitor.stop();
     const stepMs = deps.shutdownStepTimeoutMs ?? 4000;
