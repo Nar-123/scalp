@@ -1,5 +1,6 @@
 import { Connection, PublicKey, type Logs } from '@solana/web3.js';
 import { runBounded } from '../lifecycle/shutdown.js';
+import { removeLogsListenerIfSafe } from './logsListenerRemoval.js';
 import type { DiscoveredTokenEvent } from '../types/token.js';
 import type { TokenDiscoverySource } from './types.js';
 import type { Logger } from '../logging/logger.js';
@@ -117,7 +118,7 @@ export class PumpFunLogSubscriber implements TokenDiscoverySource {
     const id = this.subscriptionId;
     this.subscriptionId = null;
     if (id !== null) {
-      await runBounded(() => this.connection.removeOnLogsListener(id), this.options.stopTimeoutMs ?? 3000);
+      await runBounded(() => removeLogsListenerIfSafe(this.connection, id, this.logger, this.name), this.options.stopTimeoutMs ?? 3000);
     }
   }
 

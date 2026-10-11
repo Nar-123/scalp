@@ -124,7 +124,17 @@ export class PumpfunVolumeService implements OneMinuteVolumeProvider, NativeMark
     wsHooksAttached: boolean;
     decode: ReturnType<PumpfunVolumeEngine['decodeLatency']['summary']>;
     aggregation: ReturnType<PumpfunVolumeEngine['aggregationLatency']['summary']>;
-    recorder: { written: number; droppedFromBuffer: number; writeFailures: number } | null;
+    recorder: {
+      written: number;
+      droppedFromBuffer: number;
+      writeFailures: number;
+      prunedRows: number;
+      pruneSlices: number;
+      pruneMaxSliceMs: number;
+      pruneBatchRows: number;
+      pruneSkippedForPressure: number;
+      pruneSkippedForLag: number;
+    } | null;
     heapUsedMb: number;
   } {
     return {
@@ -134,7 +144,19 @@ export class PumpfunVolumeService implements OneMinuteVolumeProvider, NativeMark
       wsHooksAttached: this.wsHooksAttached,
       decode: this.engine.decodeLatency.summary(),
       aggregation: this.engine.aggregationLatency.summary(),
-      recorder: this.recorder ? { written: this.recorder.written, droppedFromBuffer: this.recorder.droppedFromBuffer, writeFailures: this.recorder.writeFailures } : null,
+      recorder: this.recorder
+        ? {
+            written: this.recorder.written,
+            droppedFromBuffer: this.recorder.droppedFromBuffer,
+            writeFailures: this.recorder.writeFailures,
+            prunedRows: this.recorder.prunedRows,
+            pruneSlices: this.recorder.pruneSlices,
+            pruneMaxSliceMs: Math.round(this.recorder.pruneMaxSliceMs * 10) / 10,
+            pruneBatchRows: this.recorder.pruneBatchRows,
+            pruneSkippedForPressure: this.recorder.pruneSkippedForPressure,
+            pruneSkippedForLag: this.recorder.pruneSkippedForLag,
+          }
+        : null,
       heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1e6),
     };
   }

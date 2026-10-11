@@ -17,7 +17,7 @@ import type { FetchLike } from '../../src/providers/providerGate.js';
 describe('ProviderGate: secondary hard-abandon boundary for a non-cooperating fetchImpl', () => {
   function cooperatingHang(): FetchLike {
     // Never resolves on its own, but DOES reject promptly once told to abort -- the well-behaved case.
-    return ((_url, init) => new Promise((_res, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted')), { once: true }))) as unknown as FetchLike;
+    return ((_url: unknown, init: { signal: AbortSignal }) => new Promise((_res, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted')), { once: true }))) as unknown as FetchLike;
   }
 
   function nonCooperating(): FetchLike {
