@@ -5,6 +5,7 @@ import { createLogger } from './logging/logger.js';
 import { DexscreenerBirdeyeAggregator } from './discovery/aggregatorFallbackClient.js';
 import { RaydiumLogSubscriber } from './discovery/raydiumLogSubscriber.js';
 import { PumpFunLogSubscriber } from './discovery/pumpFunLogSubscriber.js';
+import { DiscoveryLimiterReporter } from './discovery/limiterStatsReporter.js';
 import { createProviderStack } from './providers/providerStack.js';
 import { ProviderMetricsRecorder } from './providers/metricsRecorder.js';
 import { runShutdown } from './lifecycle/shutdown.js';
@@ -96,6 +97,11 @@ async function main(): Promise<void> {
     ),
   ];
 
+  // Stage 1 (observability only): per-source offered/allowed/rejected counters of the caller-side discovery fetch limit,
+  // logged once per metrics interval and once on shutdown. Reads counters only; changes no limit and no event flow.
+  const limiterReporter = new DiscoveryLimiterReporter(discoverySources, logger, cfg.providers.metricsLogIntervalMs);
+  limiterReporter.start();
+
   const stopOrchestrator = await startOrchestrator(cfg, {
     discoverySources,
     aggregator,
@@ -126,7 +132,13 @@ async function main(): Promise<void> {
     const reports = await runShutdown(
       [
         { name: 'stop_orchestrator', run: stopOrchestrator, timeoutMs: cfg.providers.shutdownStepTimeoutMs * 3 },
-        { name: 'abort_provider_requests', run: () => providers.shutdown() },
+        {
+          name: 'abort_provider_requests',
+          run: () => {
+            limiterReporter.stop();
+            return providers.shutdown();
+          },
+        },
         { name: 'stop_price_paths', run: () => shadow?.pathRecorder?.stop() },
         { name: 'stop_volume_service', run: () => volumeService?.stop() },
         // investigate/production-fetch-abandon Phase 2: flushes any still-buffered observability writes before the

@@ -6,6 +6,7 @@ import { CachedSafetyDataSource, DirectSafetyDataSource, type SafetyDataSource }
 import { ProviderError, ProviderGate, type ProviderEndpoint, type GateResponse } from './providerGate.js';
 import { ProviderMetrics } from './providerMetrics.js';
 import { PriorityAdmissionGate, type AdmissionPriority } from './priorityAdmissionGate.js';
+import { QuoteStage, StagedProviderGate, quoteStageOptions } from './quoteStage.js';
 import { redactUrl, registerSecret, secretsInUrl } from './redact.js';
 
 /** Hosts of keyless public endpoints known NOT to serve the safety gate's methods (see docs/PHASE_5_6A_PROVIDER_RELIABILITY.md). */
@@ -94,6 +95,8 @@ export interface ProviderStack {
   metrics: ProviderMetrics;
   rpcGate: ProviderGate;
   quoteGate: ProviderGate;
+  /** P1: bounded admission for evaluations waiting on the quote provider (their scheduler slot is given back meanwhile). */
+  quoteStage: QuoteStage;
   connection: Connection;
   jupiter: JupiterQuoteClient;
   safetyData: SafetyDataSource;
@@ -123,10 +126,12 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
     metrics,
     logger,
   );
-  const quoteGate = new ProviderGate(
+  const quoteStage = new QuoteStage(quoteStageOptions(q));
+  const quoteGate = new StagedProviderGate(
     { kind: 'quote', endpoints: quoteEndpoints(cfg), timeoutMs: q.timeoutMs, maxConcurrent: q.maxConcurrent, maxRequestsPerSecond: q.maxRequestsPerSecond, maxRetries: q.maxRetries, baseBackoffMs: q.baseBackoffMs, maxBackoffMs: q.maxBackoffMs, maxTotalMs: q.maxTotalMs, circuitFailureThreshold: q.circuitFailureThreshold, circuitCooldownMs: q.circuitCooldownMs, unsupportedCooldownMs: q.unsupportedCooldownMs },
     metrics,
     logger,
+    quoteStage,
   );
   // Shared-RPC-capacity fix (`investigate/shared-rpc-capacity`, Option A): evaluation and discovery both call
   // `rpcGate.execute()` (directly or via `connection`'s fetch), and `rpcGate`'s own FIFO queue has no concept of
@@ -148,6 +153,12 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
   const direct = new DirectSafetyDataSource(evaluationConnection);
   const safetyData = r.safetyDataTtlMs > 0 ? new CachedSafetyDataSource(direct, { ttlMs: r.safetyDataTtlMs, metrics }) : direct;
   const rpcClass = classifyRpcEndpoint(cfg.rpc.httpUrl);
+  // P1 observability: how many evaluations waited on / were refused by the quote stage (same cadence as the provider metrics).
+  const stageStatsTimer =
+    logger && cfg.providers.metricsLogIntervalMs > 0
+      ? setInterval(() => logger.info({ quoteStage: quoteStage.stats() }, 'quote stage'), cfg.providers.metricsLogIntervalMs)
+      : null;
+  stageStatsTimer?.unref?.();
   logger?.info(
     { rpcHost: redactUrl(cfg.rpc.httpUrl), rpcClass, rpcFallbacks: cfg.providers.rpc.fallbackUrls.map(redactUrl), quoteHost: redactUrl(cfg.aggregators.jupiterQuoteBaseUrl), quoteFallbacks: cfg.providers.quote.fallbackUrls.map(redactUrl) },
     'provider stack configured',
@@ -159,6 +170,7 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
     metrics,
     rpcGate,
     quoteGate,
+    quoteStage,
     connection,
     jupiter,
     safetyData,
@@ -166,6 +178,7 @@ export function createProviderStack(cfg: Pick<AppConfig, 'rpc' | 'providers' | '
     shutdown(): void {
       // Admission first: any caller still WAITING for a ticket (never reached `rpcGate.execute()`) is rejected
       // cleanly here rather than left waiting on a gate that's about to refuse everything anyway.
+      if (stageStatsTimer) clearInterval(stageStatsTimer);
       rpcAdmission.shutdown();
       rpcGate.shutdown();
       quoteGate.shutdown();

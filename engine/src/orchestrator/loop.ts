@@ -31,6 +31,7 @@ import { EntryReservations, EvaluationGuard, type EvaluationLease } from './eval
 import { EvaluationScheduler } from './evaluationScheduler.js';
 import { decideMarketSource } from './marketSourcePolicy.js';
 import { nativeVenueFeeBps } from './nativeFirst.js';
+import { QUOTE_NOT_REQUESTED_REASON, shouldSkipBuyQuote } from './quoteOrdering.js';
 import { buildEntryContext } from './decisionContext.js';
 import { isStaleAtDecision, snapshotCoherenceIssues } from './snapshotCoherence.js';
 import type { EvaluationMarketData } from '../types/trade.js';
@@ -113,6 +114,12 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
   // gate more simultaneous RPC demand than it can service without queueing -- no evaluation ever needs to wait in
   // ProviderGate's own waiter queue for a slot. Never below 1.
   const scheduler = new EvaluationScheduler({ maxConcurrent: Math.max(1, cfg.providers.rpc.maxConcurrent) });
+  // P1 observability: slots held / waiting on a provider / pending ticks, with high-water marks, once per metrics interval.
+  const schedulerStatsTimer =
+    cfg.providers.metricsLogIntervalMs > 0
+      ? setInterval(() => deps.logger.info({ scheduler: scheduler.stats() }, 'evaluation scheduler'), cfg.providers.metricsLogIntervalMs)
+      : null;
+  schedulerStatsTimer?.unref?.();
 
   const positionMonitor = new PositionMonitor(
     { executor: deps.executor, priceSource: deps.priceSource, aggregator: deps.aggregator, ledger: deps.ledger, emergencyStop, logger: deps.logger },
@@ -283,11 +290,26 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
     let estimatedSellPriceImpactPct: number | null = null;
     // The venue's own per-leg fee (Pump.fun protocol + creator bps of the curve); null => the configured generic fee model.
     let venueFeeBps: number | null = null;
+    // A real or shadow position open for this mint: its exit is priced with the sell impact derived from the buy quote,
+    // so the quote below is always requested for it. (Read here, before the quote; the per-token lease means nothing can
+    // open a position for this mint in between.)
+    const holdsPosition = deps.ledger.getOpenPositions().some((p) => p.mint === event.mint) || (deps.shadowRunner?.hasOpenPosition(event.mint) ?? false);
+    // Stage 2: when the 1-minute volume is already known to be unavailable on the non-native route and nothing is held,
+    // the baseline filter volume_1m_unavailable rejects this evaluation whatever the quote returns, so it is not requested.
+    const quoteSkipped = shouldSkipBuyQuote({
+      enabled: cfg.providers.skipQuoteWhenVolumeUnavailable,
+      useNative,
+      volume1mSol: liquidityVolume.volume1mSol,
+      holdsPosition,
+    });
     if (useNative && nativeSnapshot) {
       venueFeeBps = nativeVenueFeeBps(nativeSnapshot);
       estimatedPriceImpactPct = nativeSnapshot.priceImpactPct;
       buyTokenAmountRaw = nativeSnapshot.buyTokenAmountRaw;
       estimatedSellPriceImpactPct = nativeSnapshot.sellPriceImpactPct; // exact curve SELL formula (a different quantity from the buy impact)
+    } else if (quoteSkipped) {
+      // Not requested: the impact stays unknown (null => the price-impact filter fails closed, as for any unavailable quote).
+      estimatedPriceImpactPct = null;
     } else {
       const buyQuote = await deps.priceSource.getBuyExecutionQuote(event.mint, HARD_RISK_PARAMETERS.positionSizeSol);
       estimatedPriceImpactPct = buyQuote?.priceImpactPct ?? null;
@@ -302,14 +324,13 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
       sellImpactComputed = true;
       if (buyTokenAmountRaw) estimatedSellPriceImpactPct = await deps.priceSource.getSellPriceImpactPct(event.mint, buyTokenAmountRaw);
     }
-    const holdsPosition = deps.ledger.getOpenPositions().some((p) => p.mint === event.mint) || (deps.shadowRunner?.hasOpenPosition(event.mint) ?? false);
     if (holdsPosition) await ensureSellImpact();
     const estimatedSlippagePct = cfg.execution.latencySlippageBufferPct;
 
     // Phase 5.1: the read-only quote request made just above (for price
     // impact) is observed, never repeated. `quote` is data about an
     // indicative quote, not an executable transaction.
-    const quoteFetch = health && !useNative ? (deps.priceSource.takeLastQuoteFetch?.(event.mint) ?? null) : null;
+    const quoteFetch = health && !useNative && !quoteSkipped ? (deps.priceSource.takeLastQuoteFetch?.(event.mint) ?? null) : null;
     if (quoteFetch) health?.recordQuoteResult(quoteFetch.ok);
     const quoteObservation: QuoteObservation | null =
       quoteFetch && quoteFetch.ok && quoteFetch.priceImpactPct !== null
@@ -393,6 +414,8 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
     const baselineFailures = [
       ...collectBaselineFilterFailures(liquidityVolume, priceVelocity5sPct, volumeAccelerationX, estimatedPriceImpactPct, cfg),
       ...(coherenceIssues.length > 0 ? ['snapshot_timestamps_inconsistent', ...coherenceIssues] : []),
+      // Appended after the (unchanged) baseline filters: records that the quote was deliberately not requested.
+      ...(quoteSkipped ? [QUOTE_NOT_REQUESTED_REASON] : []),
     ];
     if (baselineFailures.length > 0) {
       notifyShadow(null, []);
@@ -760,6 +783,7 @@ export async function startOrchestrator(cfg: AppConfig, deps: OrchestratorDeps):
     for (const mint of [...watched.keys()]) {
       stopWatching(mint);
     }
+    if (schedulerStatsTimer) clearInterval(schedulerStatsTimer);
     scheduler.stop(); // refuses any further dispatch; already-active evaluations are left to finish (bounded by their own timeouts)
     positionMonitor.stop();
     const stepMs = deps.shutdownStepTimeoutMs ?? 4000;

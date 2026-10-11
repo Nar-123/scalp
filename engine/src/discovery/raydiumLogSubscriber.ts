@@ -1,10 +1,11 @@
 import { Connection, PublicKey, type Logs } from '@solana/web3.js';
 import { runBounded } from '../lifecycle/shutdown.js';
+import { removeLogsListenerIfSafe } from './logsListenerRemoval.js';
 import type { DiscoveredTokenEvent } from '../types/token.js';
 import type { TokenDiscoverySource } from './types.js';
 import type { Logger } from '../logging/logger.js';
 import { detectRaydiumAmmV4PoolCreation, RAYDIUM_AMM_V4_PROGRAM_ID } from './creationDetector.js';
-import { FetchRateLimiter } from './fetchRateLimiter.js';
+import { FetchRateLimiter, type FetchLimiterStats } from './fetchRateLimiter.js';
 
 export interface RaydiumLogSubscriberOptions {
   programId: string;
@@ -53,7 +54,12 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
     private readonly logger?: Logger,
   ) {
     this.programPubkey = new PublicKey(options.programId);
-    this.fetchLimiter = new FetchRateLimiter(options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND);
+    this.fetchLimiter = new FetchRateLimiter(options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND, undefined, { label: this.name });
+  }
+
+  /** Offered/allowed/rejected counters of the caller-side fetch limit (observability only; never read by the decision). */
+  getFetchLimiterStats(): FetchLimiterStats {
+    return this.fetchLimiter.stats();
   }
 
   async start(onEvent: (event: DiscoveredTokenEvent) => void): Promise<void> {
@@ -84,7 +90,7 @@ export class RaydiumLogSubscriber implements TokenDiscoverySource {
     const id = this.subscriptionId;
     this.subscriptionId = null;
     if (id !== null) {
-      await runBounded(() => this.connection.removeOnLogsListener(id), this.options.stopTimeoutMs ?? 3000);
+      await runBounded(() => removeLogsListenerIfSafe(this.connection, id, this.logger, this.name), this.options.stopTimeoutMs ?? 3000);
     }
   }
 
