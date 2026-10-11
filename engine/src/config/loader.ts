@@ -26,6 +26,19 @@ function envNum(name: string, value: string | undefined): number | undefined {
   return parsed;
 }
 
+/**
+ * Strict boolean env var: absent or blank -> undefined (zod's default applies); exactly 'true' or 'false' (any case,
+ * surrounding whitespace ignored) -> that boolean; ANYTHING ELSE is a configuration error. Unlike the lenient
+ * `envBool`, a typo such as 'yes', '1' or 'ture' can never silently become false.
+ */
+function envStrictBool(name: string, value: string | undefined): boolean | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const v = value.trim().toLowerCase();
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  throw new Error(`Invalid configuration: ${name}=${JSON.stringify(value)} must be exactly "true" or "false"`);
+}
+
 function envList(value: string | undefined): string[] | undefined {
   if (value === undefined || value.trim() === '') return undefined;
   return value.split(',').map((x) => x.trim()).filter((x) => x.length > 0);
@@ -105,6 +118,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         maxRetries: envNum('JUPITER_MAX_RETRIES', env.JUPITER_MAX_RETRIES),
         cacheTtlMs: envNum('JUPITER_QUOTE_CACHE_TTL_MS', env.JUPITER_QUOTE_CACHE_TTL_MS),
       },
+      skipQuoteWhenVolumeUnavailable: envStrictBool('SKIP_QUOTE_WHEN_VOLUME_UNAVAILABLE', env.SKIP_QUOTE_WHEN_VOLUME_UNAVAILABLE),
     },
     volume: {
       pumpfunNativeEnabled: env.PUMPFUN_NATIVE_VOLUME_ENABLED === undefined ? undefined : envBool(env.PUMPFUN_NATIVE_VOLUME_ENABLED, true),

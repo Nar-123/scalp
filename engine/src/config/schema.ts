@@ -199,6 +199,11 @@ export const ConfigSchema = z.object({
         })
         .default({}),
       metricsLogIntervalMs: z.number().int().nonnegative().default(60_000),
+      // Stage 2 (SKIP_QUOTE_WHEN_VOLUME_UNAVAILABLE): do not request the read-only BUY quote of an evaluation whose
+      // 1-minute volume is already known to be unavailable on the non-native route and for which no position is open --
+      // the baseline filter volume_1m_unavailable rejects it whatever the quote says. Changes only whether the request
+      // is made, never a filter or a verdict. Default false (previous behaviour).
+      skipQuoteWhenVolumeUnavailable: z.boolean().default(false),
       /** Upper bound for each step of the shutdown sequence. */
       shutdownStepTimeoutMs: z.number().int().positive().default(4000),
     })
