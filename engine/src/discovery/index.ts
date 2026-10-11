@@ -3,5 +3,7 @@ export * from './tokenRegistry.js';
 export * from './aggregatorFallbackClient.js';
 export * from './raydiumLogSubscriber.js';
 export * from './pumpFunLogSubscriber.js';
+export * from './fetchRateLimiter.js';
+export * from './limiterStatsReporter.js';
 export * from './programLogs.js';
 export * from './creationDetector.js';

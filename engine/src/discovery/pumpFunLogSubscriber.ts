@@ -6,7 +6,7 @@ import type { TokenDiscoverySource } from './types.js';
 import type { Logger } from '../logging/logger.js';
 import { ownLogsMatchAnyMarker } from './programLogs.js';
 import { detectPumpFunCreation } from './creationDetector.js';
-import { FetchRateLimiter } from './fetchRateLimiter.js';
+import { FetchRateLimiter, type FetchLimiterStats } from './fetchRateLimiter.js';
 
 /**
  * Cheap PRE-FILTER only, applied to the free `onLogs` push before spending
@@ -85,7 +85,12 @@ export class PumpFunLogSubscriber implements TokenDiscoverySource {
   ) {
     this.programPubkey = new PublicKey(options.programId);
     this.markers = options.creationLogMarkers ?? DEFAULT_PUMPFUN_CREATION_MARKERS;
-    this.fetchLimiter = new FetchRateLimiter(options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND);
+    this.fetchLimiter = new FetchRateLimiter(options.maxFetchesPerSecond ?? DEFAULT_MAX_FETCHES_PER_SECOND, undefined, { label: this.name });
+  }
+
+  /** Offered/allowed/rejected counters of the caller-side fetch limit (observability only; never read by the decision). */
+  getFetchLimiterStats(): FetchLimiterStats {
+    return this.fetchLimiter.stats();
   }
 
   async start(onEvent: (event: DiscoveredTokenEvent) => void): Promise<void> {
